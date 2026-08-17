@@ -108,6 +108,10 @@ def _maybe_crash(stage: str) -> None:
     """Test seam for process-crash simulation; production leaves it inert."""
 
 
+def _before_send() -> None:
+    """Test seam immediately before ownership is revalidated for SMTP I/O."""
+
+
 def _atomic_json(path: Path, value: dict) -> None:
     temporary = _stage_text(path, json.dumps(value, ensure_ascii=False, sort_keys=True) + "\n")
     try: os.replace(temporary, path)
@@ -151,12 +155,22 @@ def _reconcile_run(connection: sqlite3.Connection, run_dir: Path) -> None:
         if previous is None:
             try: current_path.unlink()
             except FileNotFoundError: pass
+            for path in (run_dir / "alerts.json", run_dir / "alerts.md"):
+                try: path.unlink()
+                except FileNotFoundError: pass
         else:
             _atomic_json(current_path, previous)
             old_directory = run_dir / previous["bundle"]
             if old_directory.exists(): _replace_output_pair(run_dir / "alerts.json", (old_directory / "alerts.json").read_text(encoding="utf-8"), run_dir / "alerts.md", (old_directory / "alerts.md").read_text(encoding="utf-8"))
     try: journal_path.unlink()
     except FileNotFoundError: pass
+
+
+def _reconcile_project(connection: sqlite3.Connection, project: Path) -> None:
+    runs = Path(project) / ".competitive-radar" / "runs"
+    if not runs.exists(): return
+    for run_dir in runs.iterdir():
+        if run_dir.is_dir(): _reconcile_run(connection, run_dir)
 
 
 def _candidate_rows(connection: sqlite3.Connection, run_id: int) -> dict[str, dict]:
@@ -268,6 +282,7 @@ def build_digest(project: Path, digest_date: date, now: datetime) -> dict:
     if now_utc < scheduled_at: return {"queued": 0, "run_id": None}
     connection = _open_database(project)
     try:
+        _reconcile_project(connection, project)
         rows = connection.execute("""SELECT d.id, d.event_fingerprint, d.body, d.recipient, e.last_run_id FROM deliveries d
             JOIN events e ON e.fingerprint = d.event_fingerprint
             WHERE d.status = 'digest_pending' AND d.local_date = ?""", (digest_date.isoformat(),)).fetchall()
@@ -275,14 +290,19 @@ def build_digest(project: Path, digest_date: date, now: datetime) -> dict:
         grouped: dict[str, list[tuple]] = {}
         for row in rows: grouped.setdefault(row[3], []).append(row)
         subject = f"[DAILY][{digest_date.isoformat()}] 竞争与客户弱信号摘要"
+        queued = 0
         with connection:
             for recipient, grouped_rows in grouped.items():
-                if connection.execute("SELECT 1 FROM digest_publications WHERE digest_date = ? AND recipient = ?", (digest_date.isoformat(), recipient)).fetchone(): continue
                 body = "\n\n".join(row[2] for row in grouped_rows)
-                cursor = connection.execute("INSERT INTO deliveries (event_fingerprint, created_at, status, kind, recipient, subject, body, attempts, next_attempt_at, local_date) VALUES (?, ?, 'pending', 'digest', ?, ?, ?, 0, ?, ?)", (grouped_rows[0][1], now_utc.isoformat(), recipient, subject, body, now_utc.isoformat(), digest_date.isoformat()))
-                connection.execute("INSERT INTO digest_publications (digest_date, recipient, delivery_id) VALUES (?, ?, ?)", (digest_date.isoformat(), recipient, cursor.lastrowid))
+                existing = connection.execute("SELECT d.id, d.status FROM digest_publications p JOIN deliveries d ON d.id = p.delivery_id WHERE p.digest_date = ? AND p.recipient = ?", (digest_date.isoformat(), recipient)).fetchone()
+                if existing and existing[1] in {"pending", "sending"}:
+                    connection.execute("UPDATE deliveries SET body = body || ? WHERE id = ?", ("\n\n" + body, existing[0]))
+                else:
+                    cursor = connection.execute("INSERT INTO deliveries (event_fingerprint, created_at, status, kind, recipient, subject, body, attempts, next_attempt_at, local_date) VALUES (?, ?, 'pending', 'digest', ?, ?, ?, 0, ?, ?)", (grouped_rows[0][1], now_utc.isoformat(), recipient, subject, body, now_utc.isoformat(), digest_date.isoformat()))
+                    if not existing: connection.execute("INSERT INTO digest_publications (digest_date, recipient, delivery_id) VALUES (?, ?, ?)", (digest_date.isoformat(), recipient, cursor.lastrowid))
+                    queued += 1
             connection.executemany("UPDATE deliveries SET status = 'digested' WHERE id = ?", [(row[0],) for row in rows])
-        return {"queued": len(grouped), "run_id": rows[0][4]}
+        return {"queued": queued, "run_id": rows[0][4]}
     finally: connection.close()
 
 
@@ -304,9 +324,10 @@ def dispatch(project: Path, now: datetime, smtp_factory=smtplib.SMTP) -> dict:
     except ValueError as error: return {"attempted": 0, "delivered": 0, "error": str(error)}
     connection = _open_database(project)
     try:
+        _reconcile_project(connection, project)
         now_text = now_utc.isoformat(); token = uuid4().hex; lease_until = (now_utc + timedelta(minutes=5)).isoformat()
         connection.execute("BEGIN IMMEDIATE")
-        rows = connection.execute("SELECT id, recipient, subject, body, attempts FROM deliveries WHERE (status = 'pending' AND next_attempt_at <= ?) OR (status = 'sending' AND lease_until <= ?) ORDER BY id", (now_text, now_text)).fetchall()
+        rows = connection.execute("SELECT id, recipient, subject, body, attempts FROM deliveries WHERE (status = 'pending' AND next_attempt_at <= ?) OR (status = 'sending' AND lease_until <= ?) ORDER BY id LIMIT 1", (now_text, now_text)).fetchall()
         for row in rows:
             connection.execute("UPDATE deliveries SET status = 'sending', claim_token = ?, lease_until = ? WHERE id = ?", (token, lease_until, row[0]))
         connection.commit()
@@ -329,14 +350,18 @@ def dispatch(project: Path, now: datetime, smtp_factory=smtplib.SMTP) -> dict:
                 smtp.starttls(context=context)
                 if username: smtp.login(username, password)
                 for row in rows:
+                    _before_send()
+                    owned = connection.execute("SELECT 1 FROM deliveries WHERE id = ? AND status = 'sending' AND claim_token = ? AND lease_until > ?", (row[0], token, now_text)).fetchone()
+                    if not owned: continue
                     message = EmailMessage(); message["From"] = sender; message["To"] = row[1]; message["Subject"] = row[2]; message.set_content(row[3])
                     try:
                         smtp.send_message(message)
                     except Exception:
                         record_failure(row)
                     else:
-                        with connection: connection.execute("UPDATE deliveries SET status = 'delivered', delivered_at = ?, claim_token = NULL, lease_until = NULL WHERE id = ? AND claim_token = ?", (now_text, row[0], token))
-                        delivered += 1
+                        with connection:
+                            updated = connection.execute("UPDATE deliveries SET status = 'delivered', delivered_at = ?, claim_token = NULL, lease_until = NULL WHERE id = ? AND claim_token = ?", (now_text, row[0], token)).rowcount
+                        delivered += updated
         except Exception:
             # A connection-level failure consumes one scheduled attempt for rows still due.
             for row in rows:

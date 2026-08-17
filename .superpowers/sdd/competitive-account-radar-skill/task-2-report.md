@@ -191,3 +191,44 @@ OK
 ```
 
 Publication now stages immutable JSON/Markdown bundles and atomically switches `current.json`; `publication.journal` reconciles interrupted work on re-entry. Dispatch claims rows in a committed SQLite transaction before SMTP I/O; the two-worker test verifies exactly one send.
+
+## Delivery state-machine gap RED
+
+Command: focused low-digest and initial-crash regressions.
+
+```
+test_late_low_alert_after_sent_digest_creates_supplemental_delivery ... FAIL
+test_dispatch_startup_reconciles_initial_manifest_crash ... FAIL
+Ran 2 tests in 1.958s
+FAILED (failures=2)
+```
+
+Lease/migration follow-up RED:
+
+```
+test_stale_worker_rechecks_lease_before_send ... ERROR
+AttributeError: module 'monitor_delivery' has no attribute '_before_send'
+test_migration_backfills_legacy_candidate_score_snapshot ... ERROR
+ValueError: alerts[0].confidence must match the candidate; alerts[0].impact must match the candidate; alerts[0].urgency must match the candidate
+Ran 2 tests in 0.984s
+FAILED (errors=2)
+```
+
+## Delivery state-machine gap GREEN
+
+```
+Ran 2 tests in 1.747s
+OK
+
+Ran 2 tests in 1.473s
+OK
+```
+
+Final full-suite command: `python -m unittest tests.test_monitor_core tests.test_monitor_delivery -v`
+
+```
+Ran 67 tests in 12.323s
+OK
+```
+
+Low alerts now append to an unsent digest or generate a supplemental digest after sending. Startup reconciliation runs for dispatch and digest, expired workers revalidate ownership immediately before SMTP I/O, and legacy candidate score snapshots are backfilled from their persisted observations.

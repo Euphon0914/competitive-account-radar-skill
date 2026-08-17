@@ -304,6 +304,16 @@ def _open_database(project: Path) -> sqlite3.Connection:
     candidate_columns = {row[1] for row in connection.execute("PRAGMA table_info(run_candidates)")}
     for name, definition in (("severity", "TEXT"), ("confidence", "REAL"), ("impact", "INTEGER"), ("urgency", "INTEGER")):
         if name not in candidate_columns: connection.execute(f"ALTER TABLE run_candidates ADD COLUMN {name} {definition}")
+    legacy_candidates = connection.execute("""SELECT c.run_id, c.event_fingerprint, o.raw_json, r.ran_at
+        FROM run_candidates c JOIN observations o ON o.id = c.observation_id JOIN runs r ON r.id = c.run_id
+        WHERE c.confidence IS NULL OR c.impact IS NULL OR c.urgency IS NULL""").fetchall()
+    for run_id, fingerprint, raw_json, ran_at in legacy_candidates:
+        try:
+            observation = json.loads(raw_json)
+            confidence = calculate_confidence(observation, datetime.fromisoformat(ran_at.replace("Z", "+00:00")))
+        except (ValueError, TypeError, json.JSONDecodeError):
+            continue
+        connection.execute("UPDATE run_candidates SET confidence = ?, impact = ?, urgency = ? WHERE run_id = ? AND event_fingerprint = ?", (confidence, observation["impact"], observation["urgency"], run_id, fingerprint))
     delivery_columns = {row[1] for row in connection.execute("PRAGMA table_info(deliveries)")}
     for name, definition in (("kind", "TEXT NOT NULL DEFAULT 'immediate'"), ("recipient", "TEXT"), ("subject", "TEXT"), ("body", "TEXT"), ("attempts", "INTEGER NOT NULL DEFAULT 0"), ("next_attempt_at", "TEXT"), ("local_date", "TEXT"), ("delivered_at", "TEXT"), ("claim_token", "TEXT"), ("lease_until", "TEXT")):
         if name not in delivery_columns: connection.execute(f"ALTER TABLE deliveries ADD COLUMN {name} {definition}")

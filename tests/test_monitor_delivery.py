@@ -338,6 +338,34 @@ class MonitorDeliveryTests(unittest.TestCase):
             self.assertEqual(len(sent), 1)
             self.assertEqual(sum(result["delivered"] for result in results), 1)
 
+    def test_stale_worker_rechecks_lease_before_send(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary); self._publish(project)
+            entered, release, calls = threading.Event(), threading.Event(), []
+            def gate():
+                calls.append(1)
+                if len(calls) == 1: entered.set(); release.wait(5)
+            class CountingSMTP(FakeSMTP):
+                def send_message(self, message): calls.append("send"); super().send_message(message)
+            results = []
+            with mock.patch.object(monitor_delivery, "_before_send", side_effect=gate):
+                first = threading.Thread(target=lambda: results.append(dispatch(project, NOW, smtp_factory=CountingSMTP)))
+                first.start(); self.assertTrue(entered.wait(5))
+                second = dispatch(project, NOW + timedelta(minutes=6), smtp_factory=CountingSMTP)
+                release.set(); first.join()
+            self.assertEqual(calls.count("send"), 1)
+            self.assertEqual(second["delivered"], 1)
+
+    def test_migration_backfills_legacy_candidate_score_snapshot(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary); run_id, candidate = candidate_project(project, severity="medium")
+            connection = sqlite3.connect(project / ".competitive-radar" / "state.db")
+            try: connection.execute("UPDATE run_candidates SET confidence = NULL, impact = NULL, urgency = NULL WHERE run_id = ?", (run_id,)); connection.commit()
+            finally: connection.close()
+            _open_database(project).close()
+            draft = project / "legacy.json"; draft.write_text(json.dumps(draft_for(run_id, candidate)), encoding="utf-8")
+            self.assertEqual(publish(project, draft, NOW)["published"], 1)
+
     def test_publish_can_follow_timestamp_normalization_without_partial_transaction(self):
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary)
@@ -369,6 +397,31 @@ class MonitorDeliveryTests(unittest.TestCase):
             self.assertEqual(build_digest(project, date(2026, 8, 17), later)["queued"], 0)
             with self.assertRaisesRegex(ValueError, "timezone"):
                 build_digest(project, date(2026, 8, 17), later.replace(tzinfo=None))
+
+    def test_late_low_alert_after_sent_digest_creates_supplemental_delivery(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary); self._publish(project, severity="low")
+            digest_time = datetime(2026, 8, 17, 9, 30, tzinfo=timezone.utc)
+            build_digest(project, date(2026, 8, 17), digest_time); self.assertEqual(dispatch(project, digest_time, smtp_factory=FakeSMTP)["delivered"], 1)
+            source = project / "observations.jsonl"; write_jsonl(source, [observation(80, impact=1, urgency=1, quality=.5, certainty=.4, content_hash="late-low")])
+            later = evaluate(project, source, "manual", NOW)
+            draft = project / "late-low.json"; draft.write_text(json.dumps(draft_for(later["run_id"], later["candidates"][0])), encoding="utf-8")
+            publish(project, draft, NOW)
+            self.assertEqual(build_digest(project, date(2026, 8, 17), digest_time)["queued"], 1)
+            self.assertEqual(dispatch(project, digest_time, smtp_factory=FakeSMTP)["delivered"], 1)
+
+    def test_dispatch_startup_reconciles_initial_manifest_crash(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary); run_id, candidate = candidate_project(project)
+            draft = project / "draft.json"; draft.write_text(json.dumps(draft_for(run_id, candidate)), encoding="utf-8")
+            with mock.patch.object(monitor_delivery, "_maybe_crash", side_effect=lambda stage: (_ for _ in ()).throw(SystemExit()) if stage == "after_manifest" else None):
+                with self.assertRaises(SystemExit): publish(project, draft, NOW)
+            run_dir = project / ".competitive-radar" / "runs" / str(run_id)
+            self.assertTrue((run_dir / "current.json").exists())
+            dispatch(project, NOW, smtp_factory=FakeSMTP)
+            self.assertFalse((run_dir / "current.json").exists())
+            self.assertFalse((run_dir / "alerts.json").exists())
+            self.assertFalse((run_dir / "alerts.md").exists())
 
     def test_dispatch_reports_missing_smtp_env_without_secrets_or_state_loss(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -476,7 +529,7 @@ class MonitorDeliveryTests(unittest.TestCase):
             draft = project / "second-low.json"; draft.write_text(json.dumps(draft_for(later["run_id"], later["candidates"][0])), encoding="utf-8")
             publish(project, draft, NOW)
             self.assertEqual(build_digest(project, date(2026, 8, 17), datetime(2026, 8, 17, 9, 30, tzinfo=timezone.utc))["queued"], 2)
-            self.assertEqual(dispatch(project, NOW, smtp_factory=FakeSMTP)["delivered"], 2)
+            self.assertEqual(dispatch(project, NOW, smtp_factory=FakeSMTP)["delivered"] + dispatch(project, NOW, smtp_factory=FakeSMTP)["delivered"], 2)
             recipients = {call[1]["To"] for instance in FakeSMTP.instances for call in instance.calls if isinstance(call, tuple) and call[0] == "send"}
             self.assertEqual(recipients, {"lin@example.com", "new@example.com"})
 
