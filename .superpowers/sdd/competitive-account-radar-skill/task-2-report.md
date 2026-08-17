@@ -163,3 +163,31 @@ OK
 ```
 
 The delivery path now uses verified TLS contexts and bounded SMTP timeouts; validates profiles and aware timestamps; snapshots all score inputs; enforces publication idempotency; catches up digest dates; claims rows before I/O with leases; normalizes persisted instants; and documents the unavoidable SMTP at-least-once crash boundary.
+
+## Crash recovery and concurrent dispatch RED
+
+Command: `python -m unittest tests.test_monitor_delivery.MonitorDeliveryTests.test_manifest_reader_only_exposes_complete_bundle_and_recovers_crash_before_queue_commit tests.test_monitor_delivery.MonitorDeliveryTests.test_two_concurrent_dispatchers_claim_one_delivery_once -v`
+
+```
+test_manifest_reader_only_exposes_complete_bundle_and_recovers_crash_before_queue_commit ... ERROR
+AttributeError: module 'monitor_delivery' has no attribute 'read_current_bundle'
+test_two_concurrent_dispatchers_claim_one_delivery_once ... ok
+Ran 2 tests in 0.274s
+FAILED (errors=1)
+```
+
+## Crash recovery and concurrent dispatch GREEN
+
+```
+Ran 2 tests in 2.121s
+OK
+```
+
+Final full-suite command: `python -m unittest tests.test_monitor_core tests.test_monitor_delivery -v`
+
+```
+Ran 63 tests in 29.009s
+OK
+```
+
+Publication now stages immutable JSON/Markdown bundles and atomically switches `current.json`; `publication.journal` reconciles interrupted work on re-entry. Dispatch claims rows in a committed SQLite transaction before SMTP I/O; the two-worker test verifies exactly one send.

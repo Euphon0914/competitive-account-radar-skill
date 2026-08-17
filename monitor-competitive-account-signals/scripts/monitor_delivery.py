@@ -104,6 +104,61 @@ def _replace_output_pair(json_path: Path, json_text: str, markdown_path: Path, m
     return old_json, old_markdown
 
 
+def _maybe_crash(stage: str) -> None:
+    """Test seam for process-crash simulation; production leaves it inert."""
+
+
+def _atomic_json(path: Path, value: dict) -> None:
+    temporary = _stage_text(path, json.dumps(value, ensure_ascii=False, sort_keys=True) + "\n")
+    try: os.replace(temporary, path)
+    finally:
+        try: temporary.unlink()
+        except FileNotFoundError: pass
+
+
+def _bundle(run_dir: Path, json_text: str, markdown_text: str) -> str:
+    bundle_id = uuid4().hex
+    directory = run_dir / "bundles" / bundle_id
+    directory.mkdir(parents=True, exist_ok=False)
+    for name, content in (("alerts.json", json_text), ("alerts.md", markdown_text)):
+        temporary = _stage_text(directory / name, content)
+        try: os.replace(temporary, directory / name)
+        finally:
+            try: temporary.unlink()
+            except FileNotFoundError: pass
+    return f"bundles/{bundle_id}"
+
+
+def read_current_bundle(run_dir: Path) -> dict:
+    """Read JSON/Markdown through the single atomic current pointer."""
+    run_dir = Path(run_dir)
+    manifest = json.loads((run_dir / "current.json").read_text(encoding="utf-8"))
+    directory = run_dir / manifest["bundle"]
+    payload = json.loads((directory / "alerts.json").read_text(encoding="utf-8"))
+    markdown = (directory / "alerts.md").read_text(encoding="utf-8")
+    heading = next(line for line in markdown.splitlines() if line.startswith("## "))
+    return {"json": payload, "markdown": markdown, "markdown_summary": heading.rsplit("：", 1)[1]}
+
+
+def _reconcile_run(connection: sqlite3.Connection, run_dir: Path) -> None:
+    journal_path, current_path = run_dir / "publication.journal", run_dir / "current.json"
+    if not journal_path.exists(): return
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    events = journal.get("events", [])
+    committed = bool(events) and all(connection.execute("SELECT 1 FROM publications WHERE run_id = ? AND event_fingerprint = ?", (journal["run_id"], event)).fetchone() for event in events)
+    if not committed:
+        previous = journal.get("previous_manifest")
+        if previous is None:
+            try: current_path.unlink()
+            except FileNotFoundError: pass
+        else:
+            _atomic_json(current_path, previous)
+            old_directory = run_dir / previous["bundle"]
+            if old_directory.exists(): _replace_output_pair(run_dir / "alerts.json", (old_directory / "alerts.json").read_text(encoding="utf-8"), run_dir / "alerts.md", (old_directory / "alerts.md").read_text(encoding="utf-8"))
+    try: journal_path.unlink()
+    except FileNotFoundError: pass
+
+
 def _candidate_rows(connection: sqlite3.Connection, run_id: int) -> dict[str, dict]:
     rows = connection.execute("""SELECT c.event_fingerprint, COALESCE(c.severity, e.severity), c.confidence, c.impact, c.urgency, o.raw_json FROM run_candidates c
         JOIN events e ON e.fingerprint = c.event_fingerprint
@@ -144,6 +199,8 @@ def publish(project: Path, draft_path: Path, now: datetime) -> dict:
     profile = _profile(project)
     connection = _open_database(project)
     try:
+        run_dir = project / ".competitive-radar" / "runs" / str(draft.get("run_id") if isinstance(draft, dict) else "invalid")
+        _reconcile_run(connection, run_dir)
         candidates = _candidate_rows(connection, draft.get("run_id") if isinstance(draft, dict) else -1)
         errors = validate_alert_draft(draft, set(candidates))
         if isinstance(draft, dict) and isinstance(draft.get("run_id"), int) and connection.execute("SELECT 1 FROM runs WHERE id = ?", (draft["run_id"],)).fetchone() is None: errors.append("run_id must reference an existing run")
@@ -163,8 +220,13 @@ def publish(project: Path, draft_path: Path, now: datetime) -> dict:
             alert = dict(original); alert["_candidate"] = candidates[alert["event_id"]]
             alert["_delivery_state"] = "digest_pending" if alert["severity"] == "low" else "pending"; alerts.append(alert)
         public = {"schema_version": "1.0", "run_id": draft["run_id"], "alerts": [{key: value for key, value in alert.items() if not key.startswith("_")} for alert in alerts]}
-        run_dir = project / ".competitive-radar" / "runs" / str(draft["run_id"])
         json_path, markdown_path = run_dir / "alerts.json", run_dir / "alerts.md"
+        json_text, markdown_text = json.dumps(public, ensure_ascii=False, indent=2) + "\n", _markdown(alerts)
+        bundle = _bundle(run_dir, json_text, markdown_text)
+        current_path = run_dir / "current.json"
+        previous_manifest = json.loads(current_path.read_text(encoding="utf-8")) if current_path.exists() else None
+        journal_path = run_dir / "publication.journal"
+        _atomic_json(journal_path, {"run_id": draft["run_id"], "events": [alert["event_id"] for alert in alerts], "previous_manifest": previous_manifest, "bundle": bundle})
         connection.execute("BEGIN IMMEDIATE")
         old_json = old_markdown = None
         replaced = False
@@ -176,13 +238,23 @@ def publish(project: Path, draft_path: Path, now: datetime) -> dict:
                 if claimed:
                     connection.execute("INSERT INTO deliveries (event_fingerprint, created_at, status, kind, recipient, subject, body, attempts, next_attempt_at, local_date) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)", (alert["event_id"], now_utc.isoformat(), alert["_delivery_state"], "digest_source" if alert["severity"] == "low" else "immediate", profile["salesperson"]["alert_email"], subject, _email_body(alert), now_utc.isoformat(), local_day))
                     inserted.append(alert)
-            old_json, old_markdown = _replace_output_pair(json_path, json.dumps(public, ensure_ascii=False, indent=2) + "\n", markdown_path, _markdown(alerts))
+            old_json, old_markdown = _replace_output_pair(json_path, json_text, markdown_path, markdown_text)
             replaced = True
+            _atomic_json(current_path, {"bundle": bundle})
+            _maybe_crash("after_manifest")
             connection.commit()
+            try: journal_path.unlink()
+            except FileNotFoundError: pass
         except Exception:
             connection.rollback()
             if replaced:
                 _restore_output(json_path, old_json); _restore_output(markdown_path, old_markdown)
+            if previous_manifest is None:
+                try: current_path.unlink()
+                except FileNotFoundError: pass
+            else: _atomic_json(current_path, previous_manifest)
+            try: journal_path.unlink()
+            except FileNotFoundError: pass
             raise
         return {"run_id": draft["run_id"], "published": len(alerts), "queued": sum(alert["severity"] != "low" for alert in inserted)}
     finally: connection.close()

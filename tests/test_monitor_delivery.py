@@ -5,6 +5,7 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -302,6 +303,40 @@ class MonitorDeliveryTests(unittest.TestCase):
             connection = sqlite3.connect(project / ".competitive-radar" / "state.db")
             try: self.assertEqual(connection.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0], 1)
             finally: connection.close()
+
+    def test_manifest_reader_only_exposes_complete_bundle_and_recovers_crash_before_queue_commit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            result, candidate = self._publish(project)
+            run_dir = project / ".competitive-radar" / "runs" / str(result["run_id"])
+            original = monitor_delivery.read_current_bundle(run_dir)
+            changed = project / "changed.json"; changed.write_text(json.dumps(draft_for(result["run_id"], candidate, summary="new complete summary")), encoding="utf-8")
+            with mock.patch.object(monitor_delivery, "_maybe_crash", side_effect=lambda stage: (_ for _ in ()).throw(SystemExit()) if stage == "after_manifest" else None):
+                with self.assertRaises(SystemExit): publish(project, changed, NOW)
+            crashed = monitor_delivery.read_current_bundle(run_dir)
+            self.assertEqual(crashed["json"]["alerts"][0]["summary"], crashed["markdown_summary"])
+            publish(project, changed, NOW)
+            recovered = monitor_delivery.read_current_bundle(run_dir)
+            self.assertIn(recovered["json"]["alerts"][0]["summary"], {"Acme lowered enterprise pricing", "new complete summary"})
+            self.assertEqual(recovered["json"]["alerts"][0]["summary"], recovered["markdown_summary"])
+            self.assertTrue((run_dir / "current.json").exists())
+
+    def test_two_concurrent_dispatchers_claim_one_delivery_once(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary); self._publish(project)
+            sent, lock, start = [], threading.Lock(), threading.Barrier(3)
+            class SharedSMTP(FakeSMTP):
+                def send_message(self, message):
+                    with lock: sent.append(message["Subject"])
+            results = []
+            def worker():
+                start.wait(); results.append(dispatch(project, NOW, smtp_factory=SharedSMTP))
+            workers = [threading.Thread(target=worker) for _ in range(2)]
+            for worker_thread in workers: worker_thread.start()
+            start.wait()
+            for worker_thread in workers: worker_thread.join()
+            self.assertEqual(len(sent), 1)
+            self.assertEqual(sum(result["delivered"] for result in results), 1)
 
     def test_publish_can_follow_timestamp_normalization_without_partial_transaction(self):
         with tempfile.TemporaryDirectory() as temporary:
