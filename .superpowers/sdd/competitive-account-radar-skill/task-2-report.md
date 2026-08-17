@@ -99,3 +99,34 @@ OK
 ```
 
 `git diff --check` passed. Publication now uses candidate-specific persisted state, explicit facade re-exports, core profile loading, compensated dual-file replacement coordinated with the queue transaction, per-recipient digests, optional SMTP login, and UTC-normalized due timestamps.
+
+## Snapshot remediation RED
+
+Command: `python -m unittest tests.test_monitor_delivery.MonitorDeliveryTests.test_medium_candidate_queues_an_immediate_individual_delivery tests.test_monitor_delivery.MonitorDeliveryTests.test_publish_uses_candidate_severity_snapshot_after_later_upgrade tests.test_monitor_delivery.MonitorDeliveryTests.test_smtp_secret_is_absent_from_every_generated_runtime_file -v`
+
+```
+test_medium_candidate_queues_an_immediate_individual_delivery ... ok
+test_publish_uses_candidate_severity_snapshot_after_later_upgrade ... ERROR
+ValueError: alerts[0].severity must match the candidate
+test_smtp_secret_is_absent_from_every_generated_runtime_file ... ok
+Ran 3 tests in 1.590s
+FAILED (errors=1)
+```
+
+The expected failure showed publication was still validating against the mutable event severity after a later upgrade.
+
+## Snapshot remediation GREEN
+
+```
+Ran 3 tests in 1.455s
+OK
+```
+
+Final full-suite command: `python -m unittest tests.test_monitor_core tests.test_monitor_delivery -v`
+
+```
+Ran 56 tests in 20.088s
+OK
+```
+
+`git diff --check` passed. `run_candidates` now persists the evaluated severity snapshot; medium delivery queueing and every generated runtime file's lack of SMTP secret values are explicitly covered.

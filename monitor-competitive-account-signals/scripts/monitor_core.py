@@ -294,9 +294,12 @@ def _open_database(project: Path) -> sqlite3.Connection:
         CREATE TABLE IF NOT EXISTS events (fingerprint TEXT PRIMARY KEY, severity TEXT, content_hash TEXT NOT NULL, first_run_id INTEGER NOT NULL REFERENCES runs(id), last_run_id INTEGER NOT NULL REFERENCES runs(id));
         CREATE TABLE IF NOT EXISTS deliveries (id INTEGER PRIMARY KEY, event_fingerprint TEXT NOT NULL REFERENCES events(fingerprint), created_at TEXT NOT NULL, status TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS digest_items (id INTEGER PRIMARY KEY, run_id INTEGER NOT NULL REFERENCES runs(id), event_fingerprint TEXT NOT NULL REFERENCES events(fingerprint));
-        CREATE TABLE IF NOT EXISTS run_candidates (run_id INTEGER NOT NULL REFERENCES runs(id), event_fingerprint TEXT NOT NULL REFERENCES events(fingerprint), observation_id INTEGER NOT NULL REFERENCES observations(id), PRIMARY KEY (run_id, event_fingerprint));
+        CREATE TABLE IF NOT EXISTS run_candidates (run_id INTEGER NOT NULL REFERENCES runs(id), event_fingerprint TEXT NOT NULL REFERENCES events(fingerprint), observation_id INTEGER NOT NULL REFERENCES observations(id), severity TEXT, PRIMARY KEY (run_id, event_fingerprint));
         CREATE INDEX IF NOT EXISTS observations_latest_baseline_idx ON observations (entity_id, signal_type, source_status, run_id DESC, id DESC);
     """)
+    candidate_columns = {row[1] for row in connection.execute("PRAGMA table_info(run_candidates)")}
+    if "severity" not in candidate_columns:
+        connection.execute("ALTER TABLE run_candidates ADD COLUMN severity TEXT")
     return connection
 
 
@@ -352,7 +355,7 @@ def evaluate(project: Path, observations_path: Path, trigger: str, now: datetime
                         connection.execute("INSERT INTO events (fingerprint, severity, content_hash, first_run_id, last_run_id) VALUES (?, ?, ?, ?, ?)", (fingerprint, severity, item["content_hash"], run_id, run_id))
                     else:
                         connection.execute("UPDATE events SET severity = ?, content_hash = ?, last_run_id = ? WHERE fingerprint = ?", (severity, item["content_hash"], run_id, fingerprint))
-                    connection.execute("INSERT INTO run_candidates (run_id, event_fingerprint, observation_id) VALUES (?, ?, ?)", (run_id, fingerprint, observation_cursor.lastrowid))
+                    connection.execute("INSERT INTO run_candidates (run_id, event_fingerprint, observation_id, severity) VALUES (?, ?, ?, ?)", (run_id, fingerprint, observation_cursor.lastrowid, severity))
                 else:
                     suppressed.append(payload)
                     connection.execute("UPDATE events SET last_run_id = ? WHERE fingerprint = ?", (run_id, fingerprint))

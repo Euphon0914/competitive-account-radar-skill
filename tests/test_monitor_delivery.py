@@ -201,6 +201,40 @@ class MonitorDeliveryTests(unittest.TestCase):
                 self.assertEqual(connection.execute("SELECT status FROM deliveries").fetchone()[0], "pending")
             finally: connection.close()
 
+    def test_medium_candidate_queues_an_immediate_individual_delivery(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            result, _ = self._publish(project, severity="medium")
+            connection = sqlite3.connect(project / ".competitive-radar" / "state.db")
+            try:
+                kind, status, subject = connection.execute("SELECT kind, status, subject FROM deliveries").fetchone()
+            finally: connection.close()
+            self.assertEqual((kind, status), ("immediate", "pending"))
+            self.assertTrue(subject.startswith("[MEDIUM][Acme]"))
+
+    def test_publish_uses_candidate_severity_snapshot_after_later_upgrade(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            original_run, original_candidate = candidate_project(project, severity="medium")
+            source = project / "observations.jsonl"
+            write_jsonl(source, [observation(90, content_hash="upgraded")])
+            upgraded = evaluate(project, source, "manual", NOW)
+            self.assertEqual(upgraded["candidates"][0]["severity"], "high")
+            draft = project / "original-medium.json"
+            draft.write_text(json.dumps(draft_for(original_run, original_candidate)), encoding="utf-8")
+            published = publish(project, draft, NOW)
+            self.assertEqual(published["queued"], 1)
+            payload = json.loads((project / ".competitive-radar" / "runs" / str(original_run) / "alerts.json").read_text(encoding="utf-8"))
+            self.assertEqual(payload["alerts"][0]["severity"], "medium")
+
+    def test_smtp_secret_is_absent_from_every_generated_runtime_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary); self._publish(project)
+            dispatch(project, NOW, smtp_factory=FakeSMTP)
+            generated = [path for path in project.rglob("*") if path.is_file()]
+            self.assertTrue(generated)
+            self.assertTrue(all(SECRET.encode("utf-8") not in path.read_bytes() for path in generated))
+
     def test_invalid_publish_preserves_prior_outputs_and_never_queues(self):
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary)

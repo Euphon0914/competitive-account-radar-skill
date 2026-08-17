@@ -101,7 +101,7 @@ def _replace_output_pair(json_path: Path, json_text: str, markdown_path: Path, m
 
 
 def _candidate_rows(connection: sqlite3.Connection, run_id: int) -> dict[str, dict]:
-    rows = connection.execute("""SELECT c.event_fingerprint, e.severity, o.raw_json FROM run_candidates c
+    rows = connection.execute("""SELECT c.event_fingerprint, COALESCE(c.severity, e.severity), o.raw_json FROM run_candidates c
         JOIN events e ON e.fingerprint = c.event_fingerprint
         JOIN observations o ON o.id = c.observation_id WHERE c.run_id = ?""", (run_id,)).fetchall()
     result = {}
