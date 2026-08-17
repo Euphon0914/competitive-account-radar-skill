@@ -1,30 +1,33 @@
-# Competitive Account Radar Skill
+# 竞争与客户战情雷达 Skill
 
-面向个人销售的竞争对手与大客户动态监控 Skill。它将 URL 和本地资料中的外部信号规范化，识别价格、产品、合作、客户业务、满意度和需求变化，并生成可追溯的销售预警与行动建议。
+`monitor-competitive-account-signals` 为个人销售提供双引擎：从公开 URL 与本地资料识别竞品价格、产品组合、合作，以及大客户业务、满意度、需求信号；再把有证据的变化转为内部预警和可执行的下一步。
 
-## 安装
+## 安装与首次使用
 
-将 `monitor-competitive-account-signals` 目录复制到 Codex Skills 目录，然后安装唯一的运行依赖：
-
-```powershell
-python monitor-competitive-account-signals/scripts/bootstrap.py --project <监控项目目录>
-```
-
-首次使用时运行交互式初始化向导。向导会询问销售姓名、预警收件邮箱、时区、SMTP 发件配置、竞争对手、大客户和资料来源；未完成必填信息前不会开始采集或发送邮件。
+复制 `monitor-competitive-account-signals` 到 Codex Skills 目录，在监控项目中运行：
 
 ```powershell
-python monitor-competitive-account-signals/scripts/monitor.py init --project <监控项目目录>
+python <skill目录>/scripts/bootstrap.py --project <监控项目目录>
+python <skill目录>/scripts/monitor.py init --project <监控项目目录>
 ```
 
-## 安全边界
+`init` 会交互询问销售姓名、内部收件邮箱、时区、SMTP 环境变量名称、竞品、大客户和来源。未完成对话不会收集、评估或发信；不要把 SMTP 密码输入向导。
 
-- SMTP 密码只从环境变量读取，不写入 YAML、SQLite、日志或 Git。
-- 真实客户资料、监控配置、运行数据库和生成的预警默认被 `.gitignore` 排除。
-- Skill 只向销售本人发送内部预警，不会自动联系客户、修改商机或承诺折扣。
+支持 URL 及 CSV、XLSX、JSON、TXT、Markdown、PDF、DOCX（先提取为观察 JSONL）。常用命令：
 
-详细工作流、数据契约和运行命令见 Skill 内的 `SKILL.md` 与 `references/`。
+```powershell
+python <skill目录>/scripts/monitor.py evaluate --project <目录> --observations <observations.jsonl> --trigger scheduled
+python <skill目录>/scripts/monitor.py publish --project <目录> --draft <alerts.draft.json>
+python <skill目录>/scripts/monitor.py dispatch --project <目录>
+python <skill目录>/scripts/monitor.py digest --project <目录> --date 2026-08-17
+```
+
+由外部任务每 60 分钟运行评估/派送，并在本地时区 17:30 调用摘要。SMTP 只从 `CI_SMTP_HOST`、`CI_SMTP_PORT`、`CI_SMTP_USERNAME`、`CI_SMTP_PASSWORD`、`CI_SMTP_FROM` 环境变量读取。
+
+## 隐私与限制
+
+本仓库的 `.gitignore` 排除监控档案、SQLite 状态、运行产物和 `.env`；若监控项目本身也是 Git 仓库，请在该项目单独排除这些文件，且不要提交真实客户、邮箱、价格或竞争情报。系统仅给销售本人发内部通知，不连接 CRM/Slack/企业微信，不联系客户，不修改合同或商机，也不自动承诺折扣。它不会自己常驻、抓取受限来源或替代人工验证。
 
 ## License
 
-Apache License 2.0。见 [LICENSE](LICENSE)。
-
+[Apache-2.0](LICENSE)。

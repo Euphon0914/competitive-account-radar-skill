@@ -1,0 +1,4 @@
+interface:
+  display_name: "竞争与客户战情雷达"
+  short_description: "持续追踪竞品与大客户变化，生成可追溯预警和个人销售行动建议"
+  default_prompt: "使用 $monitor-competitive-account-signals 创建监控档案并运行一次竞争与大客户动态扫描。"
