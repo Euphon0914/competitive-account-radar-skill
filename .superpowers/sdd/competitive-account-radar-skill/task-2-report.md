@@ -60,3 +60,42 @@ OK
 ```
 
 `git diff --check` also passed. The self-review added range validation, non-empty authorization validation, and durable retry handling for SMTP connection failures.
+
+## Review remediation RED
+
+Command: `python -m unittest tests.test_monitor_delivery -v`
+
+```
+ImportError: cannot import name '_open_database' from 'monitor'
+Ran 1 test in 0.002s
+FAILED (errors=1)
+```
+
+The focused regression suite correctly failed because the facade no longer re-exported Task 1 underscore helpers. It also contained regression coverage for persisted candidate selection, evidence association, paired output replacement rollback, stored-recipient digest grouping, no-login SMTP, UTC due comparison, and all three CLI commands.
+
+Follow-up RED after timestamp normalization was introduced:
+
+```
+test_publish_can_follow_timestamp_normalization_without_partial_transaction ... ERROR
+sqlite3.OperationalError: cannot start a transaction within a transaction
+Ran 1 test in 0.546s
+FAILED (errors=1)
+```
+
+## Review remediation GREEN
+
+Focused command: `python -m unittest tests.test_monitor_delivery -v`
+
+```
+Ran 20 tests in 10.665s
+OK
+```
+
+Final full-suite command: `python -m unittest tests.test_monitor_core tests.test_monitor_delivery -v`
+
+```
+Ran 53 tests in 18.349s
+OK
+```
+
+`git diff --check` passed. Publication now uses candidate-specific persisted state, explicit facade re-exports, core profile loading, compensated dual-file replacement coordinated with the queue transaction, per-recipient digests, optional SMTP login, and UTC-normalized due timestamps.

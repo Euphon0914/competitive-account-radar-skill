@@ -1,11 +1,13 @@
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 import yaml
 
@@ -14,7 +16,8 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "monitor-competitive-account-signals" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-from monitor import build_digest, dispatch, evaluate, publish, validate_alert_draft  # noqa: E402
+import monitor_delivery  # noqa: E402
+from monitor import _open_database, _severity_rank, _timezone_is_valid, build_digest, dispatch, evaluate, publish, validate_alert_draft  # noqa: E402
 
 
 NOW = datetime(2026, 8, 17, 12, 0, tzinfo=timezone.utc)
@@ -133,6 +136,32 @@ class MonitorDeliveryTests(unittest.TestCase):
         valid["alerts"][0]["event_id"] = "unknown"
         self.assertTrue(any("event_id" in error for error in validate_alert_draft(valid, {"event-a"})))
 
+    def test_validate_alert_draft_rejects_an_absent_non_empty_evidence_id_at_publish(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            run_id, candidate = candidate_project(project)
+            draft = project / "draft.json"
+            draft.write_text(json.dumps(draft_for(run_id, candidate, evidence_ids=["absent-evidence"])), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "evidence_ids"):
+                publish(project, draft, NOW)
+
+    def test_suppressed_events_are_not_candidates_for_a_later_publish(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            run_id, candidate = candidate_project(project)
+            source = project / "observations.jsonl"
+            write_jsonl(source, [observation(90, content_hash="high")])
+            suppressed_run = evaluate(project, source, "manual", NOW)["run_id"]
+            draft = project / "suppressed.json"
+            draft.write_text(json.dumps(draft_for(suppressed_run, candidate)), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "event_id"):
+                publish(project, draft, NOW)
+
+    def test_facade_reexports_task_one_underscore_helpers(self):
+        self.assertTrue(_timezone_is_valid("UTC"))
+        self.assertEqual(_severity_rank("high"), 3)
+        self.assertTrue(callable(_open_database))
+
     def test_validate_alert_draft_requires_strategy_fields_and_exact_questions(self):
         valid = draft_for(7, {"fingerprint": "event-a", "confidence": .9, "severity": "high", "observation": {"content_hash": "evidence-a", "impact": 4, "urgency": 4}})
         del valid["alerts"][0]["talk_track"]
@@ -187,6 +216,39 @@ class MonitorDeliveryTests(unittest.TestCase):
             try: self.assertEqual(connection.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0], 1)
             finally: connection.close()
 
+    def test_second_output_replacement_failure_restores_both_outputs_and_queue(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            result, candidate = self._publish(project)
+            run_dir = project / ".competitive-radar" / "runs" / str(result["run_id"])
+            prior_json, prior_markdown = (run_dir / "alerts.json").read_text(encoding="utf-8"), (run_dir / "alerts.md").read_text(encoding="utf-8")
+            changed = project / "changed.json"
+            changed.write_text(json.dumps(draft_for(result["run_id"], candidate, summary="Changed summary")), encoding="utf-8")
+            real_replace, calls = monitor_delivery.os.replace, []
+            def fail_second(source, target):
+                calls.append(Path(target).name)
+                if len(calls) == 2: raise OSError("injected replacement failure")
+                return real_replace(source, target)
+            with mock.patch.object(monitor_delivery.os, "replace", side_effect=fail_second):
+                with self.assertRaisesRegex(OSError, "injected"):
+                    publish(project, changed, NOW)
+            self.assertEqual((run_dir / "alerts.json").read_text(encoding="utf-8"), prior_json)
+            self.assertEqual((run_dir / "alerts.md").read_text(encoding="utf-8"), prior_markdown)
+            connection = sqlite3.connect(project / ".competitive-radar" / "state.db")
+            try: self.assertEqual(connection.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0], 1)
+            finally: connection.close()
+
+    def test_publish_can_follow_timestamp_normalization_without_partial_transaction(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            result, candidate = self._publish(project)
+            connection = sqlite3.connect(project / ".competitive-radar" / "state.db")
+            try: connection.execute("UPDATE deliveries SET next_attempt_at = ?", ("2026-08-17T10:00:00+03:00",)); connection.commit()
+            finally: connection.close()
+            draft = project / "again.json"
+            draft.write_text(json.dumps(draft_for(result["run_id"], candidate, summary="Updated summary")), encoding="utf-8")
+            self.assertEqual(publish(project, draft, NOW)["published"], 1)
+
     def test_low_alert_waits_for_local_digest_and_handles_timezone_date_boundary(self):
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary)
@@ -222,6 +284,24 @@ class MonitorDeliveryTests(unittest.TestCase):
             self.assertEqual(len(FakeSMTP.instances), 1)
             database_text = (project / ".competitive-radar" / "state.db").read_bytes()
             self.assertNotIn(SECRET.encode(), database_text)
+
+    def test_dispatch_uses_tls_without_login_when_username_is_empty(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary); self._publish(project)
+            os.environ["TEST_SMTP_USERNAME"] = ""; del os.environ["TEST_SMTP_PASSWORD"]
+            self.assertEqual(dispatch(project, NOW, smtp_factory=FakeSMTP)["delivered"], 1)
+            calls = FakeSMTP.instances[0].calls
+            self.assertEqual(calls[0], "starttls")
+            self.assertFalse(any(isinstance(call, tuple) and call[0] == "login" for call in calls))
+
+    def test_dispatch_compares_due_timestamps_as_utc_instants(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary); self._publish(project)
+            connection = sqlite3.connect(project / ".competitive-radar" / "state.db")
+            try: connection.execute("UPDATE deliveries SET next_attempt_at = ?", ("2026-08-17T10:00:00+03:00",)); connection.commit()
+            finally: connection.close()
+            result = dispatch(project, datetime(2026, 8, 17, 8, 0, tzinfo=timezone.utc), smtp_factory=FakeSMTP)
+            self.assertEqual(result["delivered"], 1)
 
     def test_failure_retries_on_schedule_then_stops_after_five_attempts(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -260,6 +340,32 @@ class MonitorDeliveryTests(unittest.TestCase):
             self.assertEqual(sent["To"], "lin@example.com")
             self.assertEqual(sent["Subject"], "[DAILY][2026-08-17] 竞争与客户弱信号摘要")
             self.assertNotIn("radar@example.test", sent["To"])
+
+    def test_digest_groups_items_by_the_recipient_stored_at_publish(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary); self._publish(project, severity="low")
+            saved = yaml.safe_load((project / "monitoring.yaml").read_text(encoding="utf-8"))
+            saved["salesperson"]["alert_email"] = "new@example.com"
+            (project / "monitoring.yaml").write_text(yaml.safe_dump(saved), encoding="utf-8")
+            source = project / "observations.jsonl"; write_jsonl(source, [observation(80, impact=1, urgency=1, quality=.5, certainty=.4, content_hash="low-two")])
+            later = evaluate(project, source, "manual", NOW)
+            draft = project / "second-low.json"; draft.write_text(json.dumps(draft_for(later["run_id"], later["candidates"][0])), encoding="utf-8")
+            publish(project, draft, NOW)
+            self.assertEqual(build_digest(project, date(2026, 8, 17), datetime(2026, 8, 17, 9, 30, tzinfo=timezone.utc))["queued"], 2)
+            self.assertEqual(dispatch(project, NOW, smtp_factory=FakeSMTP)["delivered"], 2)
+            recipients = {call[1]["To"] for instance in FakeSMTP.instances for call in instance.calls if isinstance(call, tuple) and call[0] == "send"}
+            self.assertEqual(recipients, {"lin@example.com", "new@example.com"})
+
+    def test_publish_dispatch_and_digest_cli_commands(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary); run_id, candidate = candidate_project(project)
+            draft = project / "draft.json"; draft.write_text(json.dumps(draft_for(run_id, candidate)), encoding="utf-8")
+            script = ROOT / "monitor-competitive-account-signals" / "scripts" / "monitor.py"
+            environment = dict(os.environ)
+            published = subprocess.run([sys.executable, str(script), "publish", "--project", str(project), "--draft", str(draft), "--now", NOW.isoformat()], text=True, capture_output=True, env=environment)
+            dispatched = subprocess.run([sys.executable, str(script), "dispatch", "--project", str(project), "--now", NOW.isoformat()], text=True, capture_output=True, env=environment)
+            digested = subprocess.run([sys.executable, str(script), "digest", "--project", str(project), "--date", "2026-08-17", "--now", NOW.isoformat()], text=True, capture_output=True, env=environment)
+            self.assertEqual((published.returncode, dispatched.returncode, digested.returncode), (0, 0, 0))
 
 
 if __name__ == "__main__":

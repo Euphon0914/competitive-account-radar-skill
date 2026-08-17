@@ -4,18 +4,15 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import smtplib
 import sqlite3
 import tempfile
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from email.message import EmailMessage
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-import yaml
-
-from monitor_core import _open_database, _parse_datetime
+from monitor_core import _load_profile, _open_database
 
 
 COMMITMENT_TERMS = ("guaranteed discount", "approve discount", "承诺折扣", "保证降价", "合同已批准", "费用减免")
@@ -55,37 +52,58 @@ def validate_alert_draft(draft: dict, candidate_ids: set[str]) -> list[str]:
     return errors
 
 
-def _load_profile(project: Path) -> dict:
-    try:
-        profile = yaml.safe_load((Path(project) / "monitoring.yaml").read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, yaml.YAMLError) as error:
-        raise ValueError(f"could not load monitoring.yaml: {error}") from error
-    if not isinstance(profile, dict): raise ValueError("monitoring.yaml must contain a mapping")
-    return profile
-
-
 def _ensure_schema(connection: sqlite3.Connection) -> None:
     columns = {row[1] for row in connection.execute("PRAGMA table_info(deliveries)")}
     for name, definition in (("kind", "TEXT NOT NULL DEFAULT 'immediate'"), ("recipient", "TEXT"), ("subject", "TEXT"), ("body", "TEXT"), ("attempts", "INTEGER NOT NULL DEFAULT 0"), ("next_attempt_at", "TEXT"), ("local_date", "TEXT"), ("delivered_at", "TEXT")):
         if name not in columns: connection.execute(f"ALTER TABLE deliveries ADD COLUMN {name} {definition}")
+    for delivery_id, value in connection.execute("SELECT id, next_attempt_at FROM deliveries WHERE next_attempt_at IS NOT NULL"):
+        try:
+            normalized = datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc).isoformat()
+        except (TypeError, ValueError):
+            continue
+        if normalized != value: connection.execute("UPDATE deliveries SET next_attempt_at = ? WHERE id = ?", (normalized, delivery_id))
 
 
-def _atomic_write(path: Path, text: str) -> None:
+def _stage_text(path: Path, text: str) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = None
-    try:
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False) as handle:
-            temporary_path = Path(handle.name); handle.write(text); handle.flush(); os.fsync(handle.fileno())
-        os.replace(temporary_path, path)
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False) as handle:
+        temporary_path = Path(handle.name); handle.write(text); handle.flush(); os.fsync(handle.fileno())
+    return temporary_path
+
+
+def _restore_output(path: Path, previous: str | None) -> None:
+    if previous is None:
+        try: path.unlink()
+        except FileNotFoundError: pass
+        return
+    temporary = _stage_text(path, previous)
+    try: os.replace(temporary, path)
     finally:
-        if temporary_path is not None:
-            try: temporary_path.unlink()
+        try: temporary.unlink()
+        except FileNotFoundError: pass
+
+
+def _replace_output_pair(json_path: Path, json_text: str, markdown_path: Path, markdown_text: str) -> tuple[str | None, str | None]:
+    old_json = json_path.read_text(encoding="utf-8") if json_path.exists() else None
+    old_markdown = markdown_path.read_text(encoding="utf-8") if markdown_path.exists() else None
+    json_temporary, markdown_temporary = _stage_text(json_path, json_text), _stage_text(markdown_path, markdown_text)
+    try:
+        os.replace(json_temporary, json_path)
+        os.replace(markdown_temporary, markdown_path)
+    except Exception:
+        _restore_output(json_path, old_json); _restore_output(markdown_path, old_markdown)
+        raise
+    finally:
+        for temporary in (json_temporary, markdown_temporary):
+            try: temporary.unlink()
             except FileNotFoundError: pass
+    return old_json, old_markdown
 
 
 def _candidate_rows(connection: sqlite3.Connection, run_id: int) -> dict[str, dict]:
-    rows = connection.execute("""SELECT e.fingerprint, e.severity, o.raw_json FROM events e
-        JOIN observations o ON o.run_id = e.last_run_id WHERE e.last_run_id = ?""", (run_id,)).fetchall()
+    rows = connection.execute("""SELECT c.event_fingerprint, e.severity, o.raw_json FROM run_candidates c
+        JOIN events e ON e.fingerprint = c.event_fingerprint
+        JOIN observations o ON o.id = c.observation_id WHERE c.run_id = ?""", (run_id,)).fetchall()
     result = {}
     for event_id, severity, raw in rows:
         observation = json.loads(raw)
@@ -122,6 +140,7 @@ def publish(project: Path, draft_path: Path, now: datetime) -> dict:
     connection = _open_database(project)
     try:
         _ensure_schema(connection)
+        connection.commit()
         candidates = _candidate_rows(connection, draft.get("run_id") if isinstance(draft, dict) else -1)
         errors = validate_alert_draft(draft, set(candidates))
         for index, alert in enumerate(draft.get("alerts", []) if isinstance(draft, dict) else []):
@@ -136,13 +155,22 @@ def publish(project: Path, draft_path: Path, now: datetime) -> dict:
             alert["_delivery_state"] = "digest_pending" if alert["severity"] == "low" else "pending"; alerts.append(alert)
         public = {"schema_version": "1.0", "run_id": draft["run_id"], "alerts": [{key: value for key, value in alert.items() if not key.startswith("_")} for alert in alerts]}
         run_dir = project / ".competitive-radar" / "runs" / str(draft["run_id"])
-        # Stage both replacements before mutable delivery state is committed.
-        _atomic_write(run_dir / "alerts.json", json.dumps(public, ensure_ascii=False, indent=2) + "\n")
-        _atomic_write(run_dir / "alerts.md", _markdown(alerts))
-        with connection:
+        json_path, markdown_path = run_dir / "alerts.json", run_dir / "alerts.md"
+        connection.execute("BEGIN IMMEDIATE")
+        old_json = old_markdown = None
+        replaced = False
+        try:
             for alert in alerts:
                 candidate = alert["_candidate"]; subject = f"[{alert['severity'].upper()}][{candidate['observation']['entity_name']}] {alert['summary']}"
                 connection.execute("INSERT INTO deliveries (event_fingerprint, created_at, status, kind, recipient, subject, body, attempts, next_attempt_at, local_date) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)", (alert["event_id"], now.isoformat(), alert["_delivery_state"], "digest_source" if alert["severity"] == "low" else "immediate", profile["salesperson"]["alert_email"], subject, _email_body(alert), now.isoformat(), local_day))
+            old_json, old_markdown = _replace_output_pair(json_path, json.dumps(public, ensure_ascii=False, indent=2) + "\n", markdown_path, _markdown(alerts))
+            replaced = True
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            if replaced:
+                _restore_output(json_path, old_json); _restore_output(markdown_path, old_markdown)
+            raise
         return {"run_id": draft["run_id"], "published": len(alerts), "queued": sum(alert["severity"] != "low" for alert in alerts)}
     finally: connection.close()
 
@@ -154,22 +182,27 @@ def build_digest(project: Path, digest_date: date, now: datetime) -> dict:
     connection = _open_database(project)
     try:
         _ensure_schema(connection)
-        rows = connection.execute("""SELECT d.id, d.event_fingerprint, d.body, e.last_run_id FROM deliveries d
+        rows = connection.execute("""SELECT d.id, d.event_fingerprint, d.body, d.recipient, e.last_run_id FROM deliveries d
             JOIN events e ON e.fingerprint = d.event_fingerprint
             WHERE d.status = 'digest_pending' AND d.local_date = ?""", (digest_date.isoformat(),)).fetchall()
         if not rows: return {"queued": 0, "run_id": None}
-        subject = f"[DAILY][{digest_date.isoformat()}] 竞争与客户弱信号摘要"; body = "\n\n".join(row[2] for row in rows)
+        grouped: dict[str, list[tuple]] = {}
+        for row in rows: grouped.setdefault(row[3], []).append(row)
+        subject = f"[DAILY][{digest_date.isoformat()}] 竞争与客户弱信号摘要"
         with connection:
-            connection.execute("INSERT INTO deliveries (event_fingerprint, created_at, status, kind, recipient, subject, body, attempts, next_attempt_at, local_date) VALUES (?, ?, 'pending', 'digest', ?, ?, ?, 0, ?, ?)", (rows[0][1], now.isoformat(), profile["salesperson"]["alert_email"], subject, body, now.isoformat(), digest_date.isoformat()))
+            for recipient, grouped_rows in grouped.items():
+                body = "\n\n".join(row[2] for row in grouped_rows)
+                connection.execute("INSERT INTO deliveries (event_fingerprint, created_at, status, kind, recipient, subject, body, attempts, next_attempt_at, local_date) VALUES (?, ?, 'pending', 'digest', ?, ?, ?, 0, ?, ?)", (grouped_rows[0][1], now.isoformat(), recipient, subject, body, now.isoformat(), digest_date.isoformat()))
             connection.executemany("UPDATE deliveries SET status = 'digested' WHERE id = ?", [(row[0],) for row in rows])
-        return {"queued": 1, "run_id": rows[0][3]}
+        return {"queued": len(grouped), "run_id": rows[0][4]}
     finally: connection.close()
 
 
 def _smtp_settings(profile: dict) -> tuple[str, int, str, str, str]:
     names = profile.get("smtp", {}).get("env", {})
     values = {key: os.environ.get(names.get(key, ""), "") for key in ("host", "port", "username", "password", "from")}
-    missing = [str(names.get(key, key)) for key, value in values.items() if not value and key != "username"]
+    required = ("host", "port", "from") if not values["username"] else ("host", "port", "password", "from")
+    missing = [str(names.get(key, key)) for key in required if not values[key]]
     if missing: raise ValueError("missing SMTP environment variables: " + ", ".join(missing))
     try: port = int(values["port"])
     except ValueError as error: raise ValueError("SMTP port environment variable must be an integer") from error
@@ -183,7 +216,8 @@ def dispatch(project: Path, now: datetime, smtp_factory=smtplib.SMTP) -> dict:
     connection = _open_database(project)
     try:
         _ensure_schema(connection)
-        rows = connection.execute("SELECT id, recipient, subject, body, attempts FROM deliveries WHERE status = 'pending' AND next_attempt_at <= ? ORDER BY id", (now.isoformat(),)).fetchall()
+        now_utc = now.astimezone(timezone.utc).isoformat()
+        rows = connection.execute("SELECT id, recipient, subject, body, attempts FROM deliveries WHERE status = 'pending' AND next_attempt_at <= ? ORDER BY id", (now_utc,)).fetchall()
         if not rows: return {"attempted": 0, "delivered": 0}
         host, port, username, password, sender = settings; delivered = 0
         def record_failure(row: tuple) -> None:
@@ -192,7 +226,7 @@ def dispatch(project: Path, now: datetime, smtp_factory=smtplib.SMTP) -> dict:
                 if attempts >= 5:
                     connection.execute("UPDATE deliveries SET attempts = ?, status = 'failed', next_attempt_at = NULL WHERE id = ?", (attempts, row[0]))
                 else:
-                    retry_at = (now + timedelta(minutes=RETRY_MINUTES[attempts - 1])).isoformat()
+                    retry_at = (now.astimezone(timezone.utc) + timedelta(minutes=RETRY_MINUTES[attempts - 1])).isoformat()
                     connection.execute("UPDATE deliveries SET attempts = ?, next_attempt_at = ? WHERE id = ?", (attempts, retry_at, row[0]))
         try:
             with smtp_factory(host, port) as smtp:
@@ -210,7 +244,7 @@ def dispatch(project: Path, now: datetime, smtp_factory=smtplib.SMTP) -> dict:
         except Exception:
             # A connection-level failure consumes one scheduled attempt for rows still due.
             for row in rows:
-                pending = connection.execute("SELECT 1 FROM deliveries WHERE id = ? AND status = 'pending' AND next_attempt_at <= ?", (row[0], now.isoformat())).fetchone()
+                pending = connection.execute("SELECT 1 FROM deliveries WHERE id = ? AND status = 'pending' AND next_attempt_at <= ?", (row[0], now_utc)).fetchone()
                 if pending: record_failure(row)
             return {"attempted": len(rows), "delivered": delivered, "error": "SMTP delivery failed; delivery remains pending"}
         return {"attempted": len(rows), "delivered": delivered}

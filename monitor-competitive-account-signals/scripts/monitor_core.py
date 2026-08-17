@@ -294,6 +294,7 @@ def _open_database(project: Path) -> sqlite3.Connection:
         CREATE TABLE IF NOT EXISTS events (fingerprint TEXT PRIMARY KEY, severity TEXT, content_hash TEXT NOT NULL, first_run_id INTEGER NOT NULL REFERENCES runs(id), last_run_id INTEGER NOT NULL REFERENCES runs(id));
         CREATE TABLE IF NOT EXISTS deliveries (id INTEGER PRIMARY KEY, event_fingerprint TEXT NOT NULL REFERENCES events(fingerprint), created_at TEXT NOT NULL, status TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS digest_items (id INTEGER PRIMARY KEY, run_id INTEGER NOT NULL REFERENCES runs(id), event_fingerprint TEXT NOT NULL REFERENCES events(fingerprint));
+        CREATE TABLE IF NOT EXISTS run_candidates (run_id INTEGER NOT NULL REFERENCES runs(id), event_fingerprint TEXT NOT NULL REFERENCES events(fingerprint), observation_id INTEGER NOT NULL REFERENCES observations(id), PRIMARY KEY (run_id, event_fingerprint));
         CREATE INDEX IF NOT EXISTS observations_latest_baseline_idx ON observations (entity_id, signal_type, source_status, run_id DESC, id DESC);
     """)
     return connection
@@ -326,7 +327,7 @@ def evaluate(project: Path, observations_path: Path, trigger: str, now: datetime
             recorded_only: list[dict[str, Any]] = []
             for item in observations:
                 normalized = json.dumps(item["normalized_value"], sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-                connection.execute("INSERT INTO observations (run_id, entity_id, signal_type, normalized_value, content_hash, source_status, raw_json) VALUES (?, ?, ?, ?, ?, ?, ?)", (run_id, item["entity_id"], item["signal_type"], normalized, item["content_hash"], item["source_status"], json.dumps(item, sort_keys=True, ensure_ascii=False)))
+                observation_cursor = connection.execute("INSERT INTO observations (run_id, entity_id, signal_type, normalized_value, content_hash, source_status, raw_json) VALUES (?, ?, ?, ?, ?, ?, ?)", (run_id, item["entity_id"], item["signal_type"], normalized, item["content_hash"], item["source_status"], json.dumps(item, sort_keys=True, ensure_ascii=False)))
                 if item["source_status"] != "ok":
                     recorded_only.append({"entity_id": item["entity_id"], "signal_type": item["signal_type"], "source_status": item["source_status"]})
                     continue
@@ -351,6 +352,7 @@ def evaluate(project: Path, observations_path: Path, trigger: str, now: datetime
                         connection.execute("INSERT INTO events (fingerprint, severity, content_hash, first_run_id, last_run_id) VALUES (?, ?, ?, ?, ?)", (fingerprint, severity, item["content_hash"], run_id, run_id))
                     else:
                         connection.execute("UPDATE events SET severity = ?, content_hash = ?, last_run_id = ? WHERE fingerprint = ?", (severity, item["content_hash"], run_id, fingerprint))
+                    connection.execute("INSERT INTO run_candidates (run_id, event_fingerprint, observation_id) VALUES (?, ?, ?)", (run_id, fingerprint, observation_cursor.lastrowid))
                 else:
                     suppressed.append(payload)
                     connection.execute("UPDATE events SET last_run_id = ? WHERE fingerprint = ?", (run_id, fingerprint))
