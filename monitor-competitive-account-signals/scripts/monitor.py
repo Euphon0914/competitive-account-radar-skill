@@ -5,9 +5,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -83,6 +85,27 @@ def _comma_items(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def _write_profile_atomically(target: Path, profile: dict) -> None:
+    """Durably replace a profile without reusing a predictable temporary path."""
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=target.parent,
+            prefix=f".{target.name}.", suffix=".tmp", delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            yaml.safe_dump(profile, temporary, allow_unicode=True, sort_keys=False)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, target)
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
 def run_init_wizard(project: Path, input_fn=input, output_fn=print) -> Path | None:
     """Interactively build a complete profile, writing it atomically only on success."""
     project = Path(project)
@@ -127,9 +150,7 @@ def run_init_wizard(project: Path, input_fn=input, output_fn=print) -> Path | No
         if errors:
             raise ValueError("; ".join(errors))
         project.mkdir(parents=True, exist_ok=True)
-        temporary = target.with_name(f".{target.name}.tmp")
-        temporary.write_text(yaml.safe_dump(profile, allow_unicode=True, sort_keys=False), encoding="utf-8")
-        temporary.replace(target)
+        _write_profile_atomically(target, profile)
         return target
     except (EOFError, KeyboardInterrupt):
         output_fn("Initialization cancelled.")
@@ -204,9 +225,14 @@ def _load_observations_with_lines(path: Path) -> list[tuple[int, dict]]:
     """Read and validate JSONL observations while retaining physical line numbers."""
     observations: list[tuple[int, dict]] = []
     try:
-        lines = Path(path).read_text(encoding="utf-8").splitlines()
+        raw = Path(path).read_bytes()
     except OSError as error:
         raise ValueError(f"could not read observations: {error}") from error
+    try:
+        lines = raw.decode("utf-8").splitlines()
+    except UnicodeDecodeError as error:
+        line_number = raw[:error.start].count(b"\n") + 1
+        raise ValueError(f"line {line_number}: invalid UTF-8 ({error.reason})") from error
     for line_number, line in enumerate(lines, start=1):
         if not line.strip():
             continue
@@ -261,14 +287,16 @@ def event_fingerprint(observation: dict) -> str:
 def _open_database(project: Path) -> sqlite3.Connection:
     state_dir = project / ".competitive-radar"
     state_dir.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(state_dir / "state.db")
+    connection = sqlite3.connect(state_dir / "state.db", timeout=5)
     connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("PRAGMA busy_timeout = 5000")
     connection.executescript("""
         CREATE TABLE IF NOT EXISTS runs (id INTEGER PRIMARY KEY, trigger TEXT NOT NULL, ran_at TEXT NOT NULL, baseline INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS observations (id INTEGER PRIMARY KEY, run_id INTEGER NOT NULL REFERENCES runs(id), entity_id TEXT NOT NULL, signal_type TEXT NOT NULL, normalized_value TEXT NOT NULL, content_hash TEXT NOT NULL, source_status TEXT NOT NULL, raw_json TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS events (fingerprint TEXT PRIMARY KEY, severity TEXT, content_hash TEXT NOT NULL, first_run_id INTEGER NOT NULL REFERENCES runs(id), last_run_id INTEGER NOT NULL REFERENCES runs(id));
         CREATE TABLE IF NOT EXISTS deliveries (id INTEGER PRIMARY KEY, event_fingerprint TEXT NOT NULL REFERENCES events(fingerprint), created_at TEXT NOT NULL, status TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS digest_items (id INTEGER PRIMARY KEY, run_id INTEGER NOT NULL REFERENCES runs(id), event_fingerprint TEXT NOT NULL REFERENCES events(fingerprint));
+        CREATE INDEX IF NOT EXISTS observations_latest_baseline_idx ON observations (entity_id, signal_type, source_status, run_id DESC, id DESC);
     """)
     return connection
 
@@ -289,6 +317,7 @@ def evaluate(project: Path, observations_path: Path, trigger: str, now: datetime
             raise ValueError(f"line {line_number}: {error}") from error
     connection = _open_database(Path(project))
     try:
+        connection.execute("BEGIN IMMEDIATE")
         with connection:
             prior_runs = connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
             baseline = prior_runs == 0
@@ -310,12 +339,13 @@ def evaluate(project: Path, observations_path: Path, trigger: str, now: datetime
                 severity = classify_severity(confidence, item["impact"], item["urgency"])
                 fingerprint = event_fingerprint(item)
                 existing = connection.execute("SELECT severity, content_hash FROM events WHERE fingerprint = ?", (fingerprint,)).fetchone()
-                if previous[0] == normalized and existing is None:
+                previous_value_changed = previous[0] != normalized
+                if not previous_value_changed and existing is None:
                     continue
                 if severity is None:
                     recorded_only.append({"entity_id": item["entity_id"], "signal_type": item["signal_type"], "reason": "below_alert_threshold"})
                     continue
-                should_notify = existing is None or _severity_rank(severity) > _severity_rank(existing[0]) or item["content_hash"] != existing[1]
+                should_notify = previous_value_changed or existing is None or _severity_rank(severity) > _severity_rank(existing[0]) or item["content_hash"] != existing[1]
                 payload = {"fingerprint": fingerprint, "entity_id": item["entity_id"], "entity_name": item["entity_name"], "signal_type": item["signal_type"], "confidence": confidence, "severity": severity, "observation": item}
                 if should_notify:
                     candidates.append(payload)
@@ -325,6 +355,7 @@ def evaluate(project: Path, observations_path: Path, trigger: str, now: datetime
                         connection.execute("UPDATE events SET severity = ?, content_hash = ?, last_run_id = ? WHERE fingerprint = ?", (severity, item["content_hash"], run_id, fingerprint))
                 else:
                     suppressed.append(payload)
+                    connection.execute("UPDATE events SET last_run_id = ? WHERE fingerprint = ?", (run_id, fingerprint))
             return {"schema_version": 1, "run_id": run_id, "trigger": trigger, "baseline": baseline, "candidates": candidates, "suppressed": suppressed, "recorded_only": recorded_only}
     finally:
         connection.close()

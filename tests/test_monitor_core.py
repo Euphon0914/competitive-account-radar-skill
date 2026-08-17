@@ -3,6 +3,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -85,6 +86,31 @@ class MonitorCoreTests(unittest.TestCase):
             self.assertEqual(saved["competitors"], ["Acme", "Rival"])
             self.assertEqual(saved["policy"], {"scan_interval_minutes": 60, "daily_digest_time": "17:30"})
 
+    def test_wizard_uses_only_unique_temp_files_and_preserves_unrelated_temp_name(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            stale_name = project / ".monitoring.yaml.tmp"
+            stale_name.write_text("unrelated", encoding="utf-8")
+            answers = iter(["Lin", "lin@example.com", "", "", "", "", "", "", "Acme", "", "file.txt", ""])
+            run_init_wizard(project, input_fn=lambda prompt: next(answers), output_fn=lambda _: None)
+            self.assertTrue(stale_name.exists())
+            self.assertEqual(stale_name.read_text(encoding="utf-8"), "unrelated")
+            self.assertEqual(list(project.glob(".monitoring.yaml.*.tmp")), [])
+
+    def test_wizard_prompts_smtp_environment_names_in_contract_order(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            prompts = []
+            answers = iter(["Lin", "lin@example.com", "", "", "", "", "", "", "Acme", "", "file.txt", ""])
+            run_init_wizard(Path(temporary), input_fn=lambda prompt: (prompts.append(prompt), next(answers))[1], output_fn=lambda _: None)
+            smtp_prompts = [prompt for prompt in prompts if prompt.startswith("SMTP ")]
+            self.assertEqual(smtp_prompts, [
+                "SMTP host environment-variable name [CI_SMTP_HOST]: ",
+                "SMTP port environment-variable name [CI_SMTP_PORT]: ",
+                "SMTP username environment-variable name [CI_SMTP_USERNAME]: ",
+                "SMTP password environment-variable name [CI_SMTP_PASSWORD]: ",
+                "SMTP from environment-variable name [CI_SMTP_FROM]: ",
+            ])
+
     def test_wizard_reprompts_invalid_email_and_timezone(self):
         with tempfile.TemporaryDirectory() as temporary:
             answers = iter(["Lin", "wrong", "lin@example.com", "Mars/Olympus", "UTC", "", "", "", "", "", "Acme", "", "file.txt", ""])
@@ -154,6 +180,13 @@ class MonitorCoreTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "line 2"):
                 load_observations(path)
 
+    def test_load_observations_prefixes_invalid_utf8_with_a_line_number(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "observations.jsonl"
+            path.write_bytes(b"\xff")
+            with self.assertRaisesRegex(ValueError, "line 1.*UTF-8"):
+                load_observations(path)
+
     def test_load_observations_requires_nullable_effective_date_and_normalized_value_keys(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "observations.jsonl"
@@ -212,6 +245,16 @@ class MonitorCoreTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "future"):
             calculate_confidence(future, NOW)
 
+    def test_confidence_uses_90_day_and_single_source_boundaries(self):
+        exact_90 = observation(observed_at=(NOW - timedelta(days=90)).isoformat(), source_quality=1, extraction_certainty=1, independent_sources=2)
+        post_90 = observation(observed_at=(NOW - timedelta(days=90, seconds=1)).isoformat(), source_quality=1, extraction_certainty=1, independent_sources=2)
+        high_quality_single = observation(source_quality=0.9, extraction_certainty=1, independent_sources=1)
+        normal_single = observation(source_quality=0.89, extraction_certainty=1, independent_sources=1)
+        self.assertEqual(calculate_confidence(exact_90, NOW), 0.92)
+        self.assertEqual(calculate_confidence(post_90, NOW), 0.86)
+        self.assertEqual(calculate_confidence(high_quality_single, NOW), 0.9)
+        self.assertEqual(calculate_confidence(normal_single, NOW), 0.851)
+
     def test_evaluate_prefixes_future_observations_with_their_jsonl_line(self):
         with tempfile.TemporaryDirectory() as temporary:
             project, path = Path(temporary), Path(temporary) / "observations.jsonl"
@@ -251,6 +294,33 @@ class MonitorCoreTests(unittest.TestCase):
             write_jsonl(path, [new_evidence])
             self.assertEqual(len(evaluate(project, path, "manual", NOW)["candidates"]), 1)
 
+    def test_evaluation_candidates_when_value_returns_to_an_earlier_state(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project, path = Path(temporary), Path(temporary) / "observations.jsonl"
+            for value in (100, 90, 80):
+                write_jsonl(path, [observation(value={"price": value}, content_hash=f"value-{value}")])
+                evaluate(project, path, "manual", NOW)
+            write_jsonl(path, [observation(value={"price": 90}, content_hash="value-90")])
+            result = evaluate(project, path, "manual", NOW)
+            self.assertEqual(len(result["candidates"]), 1)
+            self.assertEqual(result["candidates"][0]["observation"]["normalized_value"], {"price": 90})
+
+    def test_suppressed_event_updates_last_run_id(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project, path = Path(temporary), Path(temporary) / "observations.jsonl"
+            write_jsonl(path, [observation(value={"price": 100})])
+            evaluate(project, path, "manual", NOW)
+            changed = observation(value={"price": 90}, content_hash="changed")
+            write_jsonl(path, [changed])
+            evaluate(project, path, "manual", NOW)
+            repeat = evaluate(project, path, "manual", NOW)
+            fingerprint = event_fingerprint(changed)
+            connection = sqlite3.connect(project / ".competitive-radar" / "state.db")
+            try:
+                self.assertEqual(connection.execute("SELECT last_run_id FROM events WHERE fingerprint = ?", (fingerprint,)).fetchone()[0], repeat["run_id"])
+            finally:
+                connection.close()
+
     def test_source_failure_is_recorded_only_and_cannot_change_baseline(self):
         with tempfile.TemporaryDirectory() as temporary:
             project, path = Path(temporary), Path(temporary) / "observations.jsonl"
@@ -285,6 +355,54 @@ class MonitorCoreTests(unittest.TestCase):
                 self.assertEqual(connection.execute("SELECT COUNT(*) FROM observations").fetchone()[0], before)
             finally:
                 connection.close()
+
+    def test_in_transaction_failure_rolls_back_all_mutable_tables(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project, path = Path(temporary), Path(temporary) / "observations.jsonl"
+            write_jsonl(path, [observation(value={"price": 100})])
+            evaluate(project, path, "manual", NOW)
+            database = project / ".competitive-radar" / "state.db"
+            connection = sqlite3.connect(database)
+            try:
+                before = {table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in ("runs", "observations", "events", "deliveries", "digest_items")}
+                connection.execute("CREATE TRIGGER reject_observation BEFORE INSERT ON observations WHEN NEW.run_id > 1 BEGIN SELECT RAISE(ABORT, 'injected failure'); END")
+                connection.commit()
+            finally:
+                connection.close()
+            write_jsonl(path, [observation(value={"price": 90})])
+            with self.assertRaisesRegex(sqlite3.DatabaseError, "injected failure"):
+                evaluate(project, path, "manual", NOW)
+            connection = sqlite3.connect(database)
+            try:
+                after = {table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in before}
+            finally:
+                connection.close()
+            self.assertEqual(after, before)
+
+    def test_concurrent_first_runs_produce_exactly_one_baseline(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            paths = [project / f"observations-{index}.jsonl" for index in range(2)]
+            for path in paths:
+                write_jsonl(path, [observation()])
+            start = threading.Barrier(3)
+            results, failures = [], []
+
+            def worker(path):
+                try:
+                    start.wait()
+                    results.append(evaluate(project, path, "manual", NOW))
+                except Exception as error:  # captured for deterministic assertion below
+                    failures.append(error)
+
+            workers = [threading.Thread(target=worker, args=(path,)) for path in paths]
+            for worker_thread in workers:
+                worker_thread.start()
+            start.wait()
+            for worker_thread in workers:
+                worker_thread.join()
+            self.assertEqual(failures, [])
+            self.assertEqual(sum(result["baseline"] for result in results), 1)
 
     def test_evaluate_does_not_enqueue_delivery_or_digest_rows(self):
         with tempfile.TemporaryDirectory() as temporary:
