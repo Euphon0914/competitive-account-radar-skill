@@ -410,6 +410,30 @@ class MonitorDeliveryTests(unittest.TestCase):
             self.assertEqual(build_digest(project, date(2026, 8, 17), digest_time)["queued"], 1)
             self.assertEqual(dispatch(project, digest_time, smtp_factory=FakeSMTP)["delivered"], 1)
 
+    def test_late_low_alert_while_digest_sending_gets_supplemental_delivery(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary); self._publish(project, severity="low")
+            digest_time = datetime(2026, 8, 17, 9, 30, tzinfo=timezone.utc)
+            build_digest(project, date(2026, 8, 17), digest_time)
+            connection = sqlite3.connect(project / ".competitive-radar" / "state.db")
+            try: connection.execute("UPDATE deliveries SET status = 'sending' WHERE kind = 'digest'"); connection.commit()
+            finally: connection.close()
+            source = project / "observations.jsonl"; write_jsonl(source, [observation(80, impact=1, urgency=1, quality=.5, certainty=.4, content_hash="sending-late")])
+            later = evaluate(project, source, "manual", NOW); draft = project / "sending-late.json"; draft.write_text(json.dumps(draft_for(later["run_id"], later["candidates"][0])), encoding="utf-8")
+            publish(project, draft, NOW)
+            self.assertEqual(build_digest(project, date(2026, 8, 17), digest_time)["queued"], 1)
+
+    def test_one_dispatch_drains_two_due_deliveries(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary); self._publish(project)
+            connection = sqlite3.connect(project / ".competitive-radar" / "state.db")
+            try:
+                row = connection.execute("SELECT event_fingerprint, created_at, recipient, subject, body, next_attempt_at, local_date FROM deliveries").fetchone()
+                connection.execute("INSERT INTO deliveries (event_fingerprint, created_at, status, kind, recipient, subject, body, attempts, next_attempt_at, local_date) VALUES (?, ?, 'pending', 'immediate', ?, ?, ?, 0, ?, ?)", row)
+                connection.commit()
+            finally: connection.close()
+            self.assertEqual(dispatch(project, NOW, smtp_factory=FakeSMTP)["delivered"], 2)
+
     def test_dispatch_startup_reconciles_initial_manifest_crash(self):
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary); run_id, candidate = candidate_project(project)

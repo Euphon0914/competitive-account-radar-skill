@@ -145,25 +145,25 @@ def read_current_bundle(run_dir: Path) -> dict:
 
 
 def _reconcile_run(connection: sqlite3.Connection, run_dir: Path) -> None:
-    journal_path, current_path = run_dir / "publication.journal", run_dir / "current.json"
-    if not journal_path.exists(): return
-    journal = json.loads(journal_path.read_text(encoding="utf-8"))
-    events = journal.get("events", [])
-    committed = bool(events) and all(connection.execute("SELECT 1 FROM publications WHERE run_id = ? AND event_fingerprint = ?", (journal["run_id"], event)).fetchone() for event in events)
-    if not committed:
-        previous = journal.get("previous_manifest")
-        if previous is None:
-            try: current_path.unlink()
-            except FileNotFoundError: pass
-            for path in (run_dir / "alerts.json", run_dir / "alerts.md"):
-                try: path.unlink()
+    current_path = run_dir / "current.json"
+    for journal_path in run_dir.glob("publication.*.journal"):
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        events = journal.get("events", [])
+        committed = bool(events) and all(connection.execute("SELECT 1 FROM publications WHERE run_id = ? AND event_fingerprint = ?", (journal["run_id"], event)).fetchone() for event in events)
+        if not committed:
+            previous = journal.get("previous_manifest")
+            if previous is None:
+                try: current_path.unlink()
                 except FileNotFoundError: pass
-        else:
-            _atomic_json(current_path, previous)
-            old_directory = run_dir / previous["bundle"]
-            if old_directory.exists(): _replace_output_pair(run_dir / "alerts.json", (old_directory / "alerts.json").read_text(encoding="utf-8"), run_dir / "alerts.md", (old_directory / "alerts.md").read_text(encoding="utf-8"))
-    try: journal_path.unlink()
-    except FileNotFoundError: pass
+                for path in (run_dir / "alerts.json", run_dir / "alerts.md"):
+                    try: path.unlink()
+                    except FileNotFoundError: pass
+            else:
+                _atomic_json(current_path, previous)
+                old_directory = run_dir / previous["bundle"]
+                if old_directory.exists(): _replace_output_pair(run_dir / "alerts.json", (old_directory / "alerts.json").read_text(encoding="utf-8"), run_dir / "alerts.md", (old_directory / "alerts.md").read_text(encoding="utf-8"))
+        try: journal_path.unlink()
+        except FileNotFoundError: pass
 
 
 def _reconcile_project(connection: sqlite3.Connection, project: Path) -> None:
@@ -236,12 +236,13 @@ def publish(project: Path, draft_path: Path, now: datetime) -> dict:
         public = {"schema_version": "1.0", "run_id": draft["run_id"], "alerts": [{key: value for key, value in alert.items() if not key.startswith("_")} for alert in alerts]}
         json_path, markdown_path = run_dir / "alerts.json", run_dir / "alerts.md"
         json_text, markdown_text = json.dumps(public, ensure_ascii=False, indent=2) + "\n", _markdown(alerts)
+        # The write lock serializes same-run manifests and their attempt journals.
+        connection.execute("BEGIN IMMEDIATE")
         bundle = _bundle(run_dir, json_text, markdown_text)
         current_path = run_dir / "current.json"
         previous_manifest = json.loads(current_path.read_text(encoding="utf-8")) if current_path.exists() else None
-        journal_path = run_dir / "publication.journal"
+        journal_path = run_dir / f"publication.{uuid4().hex}.journal"
         _atomic_json(journal_path, {"run_id": draft["run_id"], "events": [alert["event_id"] for alert in alerts], "previous_manifest": previous_manifest, "bundle": bundle})
-        connection.execute("BEGIN IMMEDIATE")
         old_json = old_markdown = None
         replaced = False
         try:
@@ -295,7 +296,7 @@ def build_digest(project: Path, digest_date: date, now: datetime) -> dict:
             for recipient, grouped_rows in grouped.items():
                 body = "\n\n".join(row[2] for row in grouped_rows)
                 existing = connection.execute("SELECT d.id, d.status FROM digest_publications p JOIN deliveries d ON d.id = p.delivery_id WHERE p.digest_date = ? AND p.recipient = ?", (digest_date.isoformat(), recipient)).fetchone()
-                if existing and existing[1] in {"pending", "sending"}:
+                if existing and existing[1] == "pending":
                     connection.execute("UPDATE deliveries SET body = body || ? WHERE id = ?", ("\n\n" + body, existing[0]))
                 else:
                     cursor = connection.execute("INSERT INTO deliveries (event_fingerprint, created_at, status, kind, recipient, subject, body, attempts, next_attempt_at, local_date) VALUES (?, ?, 'pending', 'digest', ?, ?, ?, 0, ?, ?)", (grouped_rows[0][1], now_utc.isoformat(), recipient, subject, body, now_utc.isoformat(), digest_date.isoformat()))
@@ -368,5 +369,6 @@ def dispatch(project: Path, now: datetime, smtp_factory=smtplib.SMTP) -> dict:
                 pending = connection.execute("SELECT 1 FROM deliveries WHERE id = ? AND status = 'sending' AND claim_token = ?", (row[0], token)).fetchone()
                 if pending: record_failure(row)
             return {"attempted": len(rows), "delivered": delivered, "error": "SMTP delivery failed; delivery remains pending"}
-        return {"attempted": len(rows), "delivered": delivered}
+        followup = dispatch(project, now, smtp_factory=smtp_factory)
+        return {"attempted": len(rows) + followup["attempted"], "delivered": delivered + followup["delivered"]}
     finally: connection.close()

@@ -232,3 +232,29 @@ OK
 ```
 
 Low alerts now append to an unsent digest or generate a supplemental digest after sending. Startup reconciliation runs for dispatch and digest, expired workers revalidate ownership immediately before SMTP I/O, and legacy candidate score snapshots are backfilled from their persisted observations.
+
+## Digest/publication serialization RED
+
+```
+test_late_low_alert_while_digest_sending_gets_supplemental_delivery ... FAIL
+AssertionError: 0 != 1
+test_one_dispatch_drains_two_due_deliveries ... ok
+Ran 2 tests in 0.267s
+FAILED (failures=1)
+```
+
+## Digest/publication serialization GREEN
+
+```
+Ran 2 tests in 0.256s
+OK
+```
+
+Final full-suite command: `python -m unittest tests.test_monitor_core tests.test_monitor_delivery -v`
+
+```
+Ran 69 tests in 4.839s
+OK
+```
+
+Digest bodies are immutable once sending, with supplemental rows for late items; dispatch drains single-row claims until empty; and publishers serialize per-run manifests under the SQLite write lock with attempt-scoped journals.
