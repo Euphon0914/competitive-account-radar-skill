@@ -1,6 +1,7 @@
 import json
 import os
 import sqlite3
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -88,8 +89,8 @@ class FakeSMTP:
     instances = []
     fail_sends = 0
 
-    def __init__(self, host, port):
-        self.host, self.port, self.calls = host, port, []
+    def __init__(self, host, port, timeout=None):
+        self.host, self.port, self.timeout, self.calls = host, port, timeout, []
         FakeSMTP.instances.append(self)
 
     def __enter__(self):
@@ -98,8 +99,8 @@ class FakeSMTP:
     def __exit__(self, *args):
         self.calls.append("quit")
 
-    def starttls(self):
-        self.calls.append("starttls")
+    def starttls(self, context=None):
+        self.calls.append(("starttls", context))
 
     def login(self, username, password):
         self.calls.append(("login", username, password))
@@ -201,6 +202,36 @@ class MonitorDeliveryTests(unittest.TestCase):
                 self.assertEqual(connection.execute("SELECT status FROM deliveries").fetchone()[0], "pending")
             finally: connection.close()
 
+    def test_publish_rejects_duplicate_event_ids_and_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary); run_id, candidate = candidate_project(project)
+            duplicate = draft_for(run_id, candidate); duplicate["alerts"].append(dict(duplicate["alerts"][0]))
+            draft = project / "duplicate.json"; draft.write_text(json.dumps(duplicate), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "duplicate"):
+                publish(project, draft, NOW)
+            draft.write_text(json.dumps(draft_for(run_id, candidate)), encoding="utf-8")
+            publish(project, draft, NOW); publish(project, draft, NOW)
+            connection = sqlite3.connect(project / ".competitive-radar" / "state.db")
+            try: self.assertEqual(connection.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0], 1)
+            finally: connection.close()
+
+    def test_publish_rejects_naive_now_and_snapshot_mismatches_before_queueing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary); run_id, candidate = candidate_project(project)
+            draft = project / "draft.json"; draft.write_text(json.dumps(draft_for(run_id, candidate, confidence=.1, impact=1, urgency=1)), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "confidence"):
+                publish(project, draft, NOW)
+            draft.write_text(json.dumps(draft_for(run_id, candidate)), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "timezone"):
+                publish(project, draft, NOW.replace(tzinfo=None))
+
+    def test_publish_rejects_header_injection(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary); run_id, candidate = candidate_project(project)
+            draft = project / "draft.json"; draft.write_text(json.dumps(draft_for(run_id, candidate, summary="ok\r\nBcc: attacker@example.com")), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "header"):
+                publish(project, draft, NOW)
+
     def test_medium_candidate_queues_an_immediate_individual_delivery(self):
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary)
@@ -295,6 +326,15 @@ class MonitorDeliveryTests(unittest.TestCase):
             tomorrow = build_digest(project, date(2026, 8, 18), datetime(2026, 8, 17, 16, 0, tzinfo=timezone.utc))
             self.assertEqual(tomorrow["queued"], 0)
 
+    def test_digest_catches_up_prior_local_date_once_per_recipient_and_rejects_naive_now(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary); self._publish(project, severity="low")
+            later = datetime(2026, 8, 18, 10, 0, tzinfo=timezone.utc)
+            self.assertEqual(build_digest(project, date(2026, 8, 17), later)["queued"], 1)
+            self.assertEqual(build_digest(project, date(2026, 8, 17), later)["queued"], 0)
+            with self.assertRaisesRegex(ValueError, "timezone"):
+                build_digest(project, date(2026, 8, 17), later.replace(tzinfo=None))
+
     def test_dispatch_reports_missing_smtp_env_without_secrets_or_state_loss(self):
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary); self._publish(project)
@@ -312,7 +352,8 @@ class MonitorDeliveryTests(unittest.TestCase):
             sent = dispatch(project, NOW, smtp_factory=FakeSMTP)
             self.assertEqual(sent["delivered"], 1)
             calls = FakeSMTP.instances[0].calls
-            self.assertEqual(calls[0], "starttls"); self.assertEqual(calls[1], ("login", "lin", SECRET)); self.assertEqual(calls[2][0], "send")
+            self.assertEqual(calls[0][0], "starttls"); self.assertIsInstance(calls[0][1], ssl.SSLContext); self.assertEqual(calls[0][1].verify_mode, ssl.CERT_REQUIRED); self.assertTrue(calls[0][1].check_hostname)
+            self.assertEqual(calls[1], ("login", "lin", SECRET)); self.assertEqual(calls[2][0], "send"); self.assertEqual(FakeSMTP.instances[0].timeout, 10)
             self.assertEqual(calls[2][1]["Subject"], "[HIGH][Acme] Acme lowered enterprise pricing")
             self.assertEqual(dispatch(project, NOW + timedelta(minutes=1), smtp_factory=FakeSMTP)["delivered"], 0)
             self.assertEqual(len(FakeSMTP.instances), 1)
@@ -325,7 +366,7 @@ class MonitorDeliveryTests(unittest.TestCase):
             os.environ["TEST_SMTP_USERNAME"] = ""; del os.environ["TEST_SMTP_PASSWORD"]
             self.assertEqual(dispatch(project, NOW, smtp_factory=FakeSMTP)["delivered"], 1)
             calls = FakeSMTP.instances[0].calls
-            self.assertEqual(calls[0], "starttls")
+            self.assertEqual(calls[0][0], "starttls")
             self.assertFalse(any(isinstance(call, tuple) and call[0] == "login" for call in calls))
 
     def test_dispatch_compares_due_timestamps_as_utc_instants(self):
@@ -336,6 +377,20 @@ class MonitorDeliveryTests(unittest.TestCase):
             finally: connection.close()
             result = dispatch(project, datetime(2026, 8, 17, 8, 0, tzinfo=timezone.utc), smtp_factory=FakeSMTP)
             self.assertEqual(result["delivered"], 1)
+
+    def test_dispatch_rejects_naive_now_and_claims_delivery_before_sending(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary); self._publish(project)
+            with self.assertRaisesRegex(ValueError, "timezone"):
+                dispatch(project, NOW.replace(tzinfo=None), smtp_factory=FakeSMTP)
+            testcase = self
+            class InspectingSMTP(FakeSMTP):
+                def send_message(self, message):
+                    connection = sqlite3.connect(project / ".competitive-radar" / "state.db")
+                    try: testcase.assertEqual(connection.execute("SELECT status FROM deliveries").fetchone()[0], "sending")
+                    finally: connection.close()
+                    super().send_message(message)
+            self.assertEqual(dispatch(project, NOW, smtp_factory=InspectingSMTP)["delivered"], 1)
 
     def test_failure_retries_on_schedule_then_stops_after_five_attempts(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -355,7 +410,7 @@ class MonitorDeliveryTests(unittest.TestCase):
     def test_connection_failure_uses_the_same_durable_retry_schedule(self):
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary); self._publish(project)
-            def unavailable(host, port):
+            def unavailable(host, port, timeout=None):
                 raise OSError("unavailable")
             self.assertEqual(dispatch(project, NOW, smtp_factory=unavailable)["attempted"], 1)
             connection = sqlite3.connect(project / ".competitive-radar" / "state.db")

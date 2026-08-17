@@ -130,3 +130,36 @@ OK
 ```
 
 `git diff --check` passed. `run_candidates` now persists the evaluated severity snapshot; medium delivery queueing and every generated runtime file's lack of SMTP secret values are explicitly covered.
+
+## Reliability hardening RED
+
+Command: focused delivery reliability regressions.
+
+```
+test_publish_rejects_duplicate_event_ids_and_is_idempotent ... FAIL
+test_publish_rejects_naive_now_and_snapshot_mismatches_before_queueing ... FAIL
+test_publish_rejects_header_injection ... FAIL
+test_digest_catches_up_prior_local_date_once_per_recipient_and_rejects_naive_now ... FAIL
+test_dispatch_uses_tls_login_and_never_resends_success ... FAIL
+test_dispatch_rejects_naive_now_and_claims_delivery_before_sending ... FAIL
+Ran 6 tests in 2.476s
+FAILED (failures=6)
+```
+
+## Reliability hardening GREEN
+
+Focused rerun:
+
+```
+Ran 6 tests in 0.819s
+OK
+```
+
+Final full-suite command: `python -m unittest tests.test_monitor_core tests.test_monitor_delivery -v`
+
+```
+Ran 61 tests in 10.435s
+OK
+```
+
+The delivery path now uses verified TLS contexts and bounded SMTP timeouts; validates profiles and aware timestamps; snapshots all score inputs; enforces publication idempotency; catches up digest dates; claims rows before I/O with leases; normalizes persisted instants; and documents the unavoidable SMTP at-least-once crash boundary.

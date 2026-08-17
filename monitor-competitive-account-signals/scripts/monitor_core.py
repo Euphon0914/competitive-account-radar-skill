@@ -25,6 +25,7 @@ SMTP_DEFAULTS = {
     "host": "CI_SMTP_HOST", "port": "CI_SMTP_PORT", "username": "CI_SMTP_USERNAME",
     "password": "CI_SMTP_PASSWORD", "from": "CI_SMTP_FROM",
 }
+SCHEMA_VERSION = 4
 
 
 def _timezone_is_valid(value: object) -> bool:
@@ -294,12 +295,25 @@ def _open_database(project: Path) -> sqlite3.Connection:
         CREATE TABLE IF NOT EXISTS events (fingerprint TEXT PRIMARY KEY, severity TEXT, content_hash TEXT NOT NULL, first_run_id INTEGER NOT NULL REFERENCES runs(id), last_run_id INTEGER NOT NULL REFERENCES runs(id));
         CREATE TABLE IF NOT EXISTS deliveries (id INTEGER PRIMARY KEY, event_fingerprint TEXT NOT NULL REFERENCES events(fingerprint), created_at TEXT NOT NULL, status TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS digest_items (id INTEGER PRIMARY KEY, run_id INTEGER NOT NULL REFERENCES runs(id), event_fingerprint TEXT NOT NULL REFERENCES events(fingerprint));
-        CREATE TABLE IF NOT EXISTS run_candidates (run_id INTEGER NOT NULL REFERENCES runs(id), event_fingerprint TEXT NOT NULL REFERENCES events(fingerprint), observation_id INTEGER NOT NULL REFERENCES observations(id), severity TEXT, PRIMARY KEY (run_id, event_fingerprint));
+        CREATE TABLE IF NOT EXISTS run_candidates (run_id INTEGER NOT NULL REFERENCES runs(id), event_fingerprint TEXT NOT NULL REFERENCES events(fingerprint), observation_id INTEGER NOT NULL REFERENCES observations(id), severity TEXT, confidence REAL, impact INTEGER, urgency INTEGER, PRIMARY KEY (run_id, event_fingerprint));
+        CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS publications (run_id INTEGER NOT NULL REFERENCES runs(id), event_fingerprint TEXT NOT NULL REFERENCES events(fingerprint), PRIMARY KEY(run_id, event_fingerprint));
+        CREATE TABLE IF NOT EXISTS digest_publications (digest_date TEXT NOT NULL, recipient TEXT NOT NULL, delivery_id INTEGER NOT NULL REFERENCES deliveries(id), PRIMARY KEY(digest_date, recipient));
         CREATE INDEX IF NOT EXISTS observations_latest_baseline_idx ON observations (entity_id, signal_type, source_status, run_id DESC, id DESC);
     """)
     candidate_columns = {row[1] for row in connection.execute("PRAGMA table_info(run_candidates)")}
-    if "severity" not in candidate_columns:
-        connection.execute("ALTER TABLE run_candidates ADD COLUMN severity TEXT")
+    for name, definition in (("severity", "TEXT"), ("confidence", "REAL"), ("impact", "INTEGER"), ("urgency", "INTEGER")):
+        if name not in candidate_columns: connection.execute(f"ALTER TABLE run_candidates ADD COLUMN {name} {definition}")
+    delivery_columns = {row[1] for row in connection.execute("PRAGMA table_info(deliveries)")}
+    for name, definition in (("kind", "TEXT NOT NULL DEFAULT 'immediate'"), ("recipient", "TEXT"), ("subject", "TEXT"), ("body", "TEXT"), ("attempts", "INTEGER NOT NULL DEFAULT 0"), ("next_attempt_at", "TEXT"), ("local_date", "TEXT"), ("delivered_at", "TEXT"), ("claim_token", "TEXT"), ("lease_until", "TEXT")):
+        if name not in delivery_columns: connection.execute(f"ALTER TABLE deliveries ADD COLUMN {name} {definition}")
+    for field in ("created_at", "next_attempt_at", "delivered_at", "lease_until"):
+        for delivery_id, value in connection.execute(f"SELECT id, {field} FROM deliveries WHERE {field} IS NOT NULL"):
+            try: normalized = datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc).isoformat()
+            except (TypeError, ValueError): continue
+            if normalized != value: connection.execute(f"UPDATE deliveries SET {field} = ? WHERE id = ?", (normalized, delivery_id))
+    connection.execute("INSERT INTO schema_meta(key, value) VALUES ('version', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(SCHEMA_VERSION),))
+    connection.commit()
     return connection
 
 
@@ -355,7 +369,7 @@ def evaluate(project: Path, observations_path: Path, trigger: str, now: datetime
                         connection.execute("INSERT INTO events (fingerprint, severity, content_hash, first_run_id, last_run_id) VALUES (?, ?, ?, ?, ?)", (fingerprint, severity, item["content_hash"], run_id, run_id))
                     else:
                         connection.execute("UPDATE events SET severity = ?, content_hash = ?, last_run_id = ? WHERE fingerprint = ?", (severity, item["content_hash"], run_id, fingerprint))
-                    connection.execute("INSERT INTO run_candidates (run_id, event_fingerprint, observation_id, severity) VALUES (?, ?, ?, ?)", (run_id, fingerprint, observation_cursor.lastrowid, severity))
+                    connection.execute("INSERT INTO run_candidates (run_id, event_fingerprint, observation_id, severity, confidence, impact, urgency) VALUES (?, ?, ?, ?, ?, ?, ?)", (run_id, fingerprint, observation_cursor.lastrowid, severity, confidence, item["impact"], item["urgency"]))
                 else:
                     suppressed.append(payload)
                     connection.execute("UPDATE events SET last_run_id = ? WHERE fingerprint = ?", (run_id, fingerprint))
