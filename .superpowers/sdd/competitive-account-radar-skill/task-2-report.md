@@ -269,3 +269,12 @@ OK
 ```
 
 Digest selection and mutation now run under one SQLite write transaction with pending-row guards. Dispatch uses an explicit resource-releasing loop rather than recursion, and publication reconciliation is locked before journal scanning.
+
+## Final dispatch/recovery lock GREEN
+
+```
+Ran 69 tests in 4.858s
+OK
+```
+
+Subsequent dispatch-batch errors are propagated to the caller, and dispatcher reconciliation is performed inside the same SQLite write transaction as the delivery claim.

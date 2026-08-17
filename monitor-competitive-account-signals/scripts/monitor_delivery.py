@@ -333,9 +333,9 @@ def _dispatch_once(project: Path, now: datetime, smtp_factory=smtplib.SMTP) -> d
     except ValueError as error: return {"attempted": 0, "delivered": 0, "error": str(error)}
     connection = _open_database(project)
     try:
-        _reconcile_project(connection, project)
         now_text = now_utc.isoformat(); token = uuid4().hex; lease_until = (now_utc + timedelta(minutes=5)).isoformat()
         connection.execute("BEGIN IMMEDIATE")
+        _reconcile_project(connection, project)
         rows = connection.execute("SELECT id, recipient, subject, body, attempts FROM deliveries WHERE (status = 'pending' AND next_attempt_at <= ?) OR (status = 'sending' AND lease_until <= ?) ORDER BY id LIMIT 1", (now_text, now_text)).fetchall()
         for row in rows:
             connection.execute("UPDATE deliveries SET status = 'sending', claim_token = ?, lease_until = ? WHERE id = ?", (token, lease_until, row[0]))
@@ -387,5 +387,7 @@ def dispatch(project: Path, now: datetime, smtp_factory=smtplib.SMTP) -> dict:
     while True:
         result = _dispatch_once(project, now, smtp_factory=smtp_factory)
         attempted += result["attempted"]; delivered += result["delivered"]
+        if "error" in result:
+            return {"attempted": attempted, "delivered": delivered, "error": result["error"]}
         if not result["attempted"]:
             return {"attempted": attempted, "delivered": delivered, **({"error": result["error"]} if "error" in result else {})}
