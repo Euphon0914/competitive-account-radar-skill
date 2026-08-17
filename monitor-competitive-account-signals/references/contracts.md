@@ -10,7 +10,7 @@
 
 ## 评估与输出
 
-`evaluate` 输出 `run_id`、`baseline`、`candidates`、`suppressed` 与 `recorded_only`。首次成功运行是基线。`publish` 的草稿及 `alerts.json`/`alerts.md` 使用同一事件 ID；每个告警必须有证据、前后值、影响、24 小时/7 天行动、发现式问题、沟通话术、假设和升级条件。状态写入项目 `.competitive-radar/` 的 SQLite，不写入 Skill 或 Git 仓库。
+`evaluate` 输出 `run_id`、`baseline`、`candidates`、`suppressed` 与 `recorded_only`。首次成功运行是基线。`publish` 草稿必须有 `schema_version: "1.0"`、正整数 `run_id` 和 `alerts`；每项告警有候选 `event_id`、非空 `evidence_ids`、`summary`、`why_it_matters`、`talk_track`、`value_proposition`、`assumptions`、`escalation_condition`、0–1 `confidence`、1–5 `impact`/`urgency`、`high`/`medium`/`low` `severity`、非空 `actions_24h`/`actions_7d` 以及恰好三项 `discovery_questions`。`alerts.json`/`alerts.md` 使用同一事件 ID；若含承诺性措辞还必须有 `authorization_required`。状态写入项目 `.competitive-radar/` 的 SQLite；若该项目是 Git 仓库，由使用者自行忽略它。
 
 ## SMTP
 

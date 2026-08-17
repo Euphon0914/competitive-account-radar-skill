@@ -33,6 +33,8 @@ class BootstrapAndMetadataTests(unittest.TestCase):
             interpreter = bootstrap_module.interpreter_for(venv_dir)
             interpreter.parent.mkdir(parents=True)
             interpreter.touch()
+            (venv_dir / "pyvenv.cfg").write_text("home = test\n", encoding="utf-8")
+            (venv_dir.parent / ".bootstrap-managed").write_text("competitive-account-radar\n", encoding="utf-8")
             commands = []
             result = bootstrap_module.bootstrap(project, runner=lambda command: commands.append(command))
             self.assertEqual(result, interpreter)

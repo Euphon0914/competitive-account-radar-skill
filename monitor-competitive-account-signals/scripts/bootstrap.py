@@ -13,9 +13,16 @@ def interpreter_for(venv_dir: Path) -> Path:
 def bootstrap(project: Path, runner: Callable[[Sequence[str]], object] | None = None) -> Path:
     venv_dir = Path(project) / ".competitive-radar" / "venv"
     interpreter = interpreter_for(venv_dir)
+    marker = venv_dir.parent / ".bootstrap-managed"
     if not interpreter.exists():
         venv_dir.parent.mkdir(parents=True, exist_ok=True)
         venv.EnvBuilder(with_pip=True).create(venv_dir)
+        marker.write_text("competitive-account-radar\n", encoding="utf-8")
+    else:
+        resolved_root = venv_dir.resolve()
+        resolved_interpreter = interpreter.resolve()
+        if not marker.is_file() or not (venv_dir / "pyvenv.cfg").is_file() or not resolved_interpreter.is_relative_to(resolved_root):
+            raise RuntimeError("refusing an unmanaged or externally linked monitoring virtual environment")
     requirements = Path(__file__).resolve().parents[1] / "requirements.txt"
     (runner or (lambda args: subprocess.run(args, check=True)))([str(interpreter), "-m", "pip", "install", "--requirement", str(requirements)])
     return interpreter
