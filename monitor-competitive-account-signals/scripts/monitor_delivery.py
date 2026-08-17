@@ -213,6 +213,7 @@ def publish(project: Path, draft_path: Path, now: datetime) -> dict:
     profile = _profile(project)
     connection = _open_database(project)
     try:
+        connection.execute("BEGIN IMMEDIATE")
         run_dir = project / ".competitive-radar" / "runs" / str(draft.get("run_id") if isinstance(draft, dict) else "invalid")
         _reconcile_run(connection, run_dir)
         candidates = _candidate_rows(connection, draft.get("run_id") if isinstance(draft, dict) else -1)
@@ -237,7 +238,6 @@ def publish(project: Path, draft_path: Path, now: datetime) -> dict:
         json_path, markdown_path = run_dir / "alerts.json", run_dir / "alerts.md"
         json_text, markdown_text = json.dumps(public, ensure_ascii=False, indent=2) + "\n", _markdown(alerts)
         # The write lock serializes same-run manifests and their attempt journals.
-        connection.execute("BEGIN IMMEDIATE")
         bundle = _bundle(run_dir, json_text, markdown_text)
         current_path = run_dir / "current.json"
         previous_manifest = json.loads(current_path.read_text(encoding="utf-8")) if current_path.exists() else None
@@ -283,6 +283,7 @@ def build_digest(project: Path, digest_date: date, now: datetime) -> dict:
     if now_utc < scheduled_at: return {"queued": 0, "run_id": None}
     connection = _open_database(project)
     try:
+        connection.execute("BEGIN IMMEDIATE")
         _reconcile_project(connection, project)
         rows = connection.execute("""SELECT d.id, d.event_fingerprint, d.body, d.recipient, e.last_run_id FROM deliveries d
             JOIN events e ON e.fingerprint = d.event_fingerprint
@@ -292,18 +293,25 @@ def build_digest(project: Path, digest_date: date, now: datetime) -> dict:
         for row in rows: grouped.setdefault(row[3], []).append(row)
         subject = f"[DAILY][{digest_date.isoformat()}] 竞争与客户弱信号摘要"
         queued = 0
-        with connection:
+        try:
             for recipient, grouped_rows in grouped.items():
                 body = "\n\n".join(row[2] for row in grouped_rows)
                 existing = connection.execute("SELECT d.id, d.status FROM digest_publications p JOIN deliveries d ON d.id = p.delivery_id WHERE p.digest_date = ? AND p.recipient = ?", (digest_date.isoformat(), recipient)).fetchone()
                 if existing and existing[1] == "pending":
-                    connection.execute("UPDATE deliveries SET body = body || ? WHERE id = ?", ("\n\n" + body, existing[0]))
+                    appended = connection.execute("UPDATE deliveries SET body = body || ? WHERE id = ? AND status = 'pending'", ("\n\n" + body, existing[0])).rowcount
+                    if appended: continue
                 else:
                     cursor = connection.execute("INSERT INTO deliveries (event_fingerprint, created_at, status, kind, recipient, subject, body, attempts, next_attempt_at, local_date) VALUES (?, ?, 'pending', 'digest', ?, ?, ?, 0, ?, ?)", (grouped_rows[0][1], now_utc.isoformat(), recipient, subject, body, now_utc.isoformat(), digest_date.isoformat()))
                     if not existing: connection.execute("INSERT INTO digest_publications (digest_date, recipient, delivery_id) VALUES (?, ?, ?)", (digest_date.isoformat(), recipient, cursor.lastrowid))
                     queued += 1
+                if existing and existing[1] == "pending":
+                    cursor = connection.execute("INSERT INTO deliveries (event_fingerprint, created_at, status, kind, recipient, subject, body, attempts, next_attempt_at, local_date) VALUES (?, ?, 'pending', 'digest', ?, ?, ?, 0, ?, ?)", (grouped_rows[0][1], now_utc.isoformat(), recipient, subject, body, now_utc.isoformat(), digest_date.isoformat()))
+                    queued += 1
             connection.executemany("UPDATE deliveries SET status = 'digested' WHERE id = ?", [(row[0],) for row in rows])
-        return {"queued": queued, "run_id": rows[0][4]}
+            connection.commit()
+            return {"queued": queued, "run_id": rows[0][4]}
+        except Exception:
+            connection.rollback(); raise
     finally: connection.close()
 
 
@@ -318,7 +326,7 @@ def _smtp_settings(profile: dict) -> tuple[str, int, str, str, str]:
     return values["host"], port, values["username"], values["password"], values["from"]
 
 
-def dispatch(project: Path, now: datetime, smtp_factory=smtplib.SMTP) -> dict:
+def _dispatch_once(project: Path, now: datetime, smtp_factory=smtplib.SMTP) -> dict:
     now_utc = _utc(now)
     project = Path(project); profile = _profile(project)
     try: settings = _smtp_settings(profile)
@@ -369,6 +377,15 @@ def dispatch(project: Path, now: datetime, smtp_factory=smtplib.SMTP) -> dict:
                 pending = connection.execute("SELECT 1 FROM deliveries WHERE id = ? AND status = 'sending' AND claim_token = ?", (row[0], token)).fetchone()
                 if pending: record_failure(row)
             return {"attempted": len(rows), "delivered": delivered, "error": "SMTP delivery failed; delivery remains pending"}
-        followup = dispatch(project, now, smtp_factory=smtp_factory)
-        return {"attempted": len(rows) + followup["attempted"], "delivered": delivered + followup["delivered"]}
+        return {"attempted": len(rows), "delivered": delivered}
     finally: connection.close()
+
+
+def dispatch(project: Path, now: datetime, smtp_factory=smtplib.SMTP) -> dict:
+    """Drain one transactionally claimed delivery per short-lived connection."""
+    attempted = delivered = 0
+    while True:
+        result = _dispatch_once(project, now, smtp_factory=smtp_factory)
+        attempted += result["attempted"]; delivered += result["delivered"]
+        if not result["attempted"]:
+            return {"attempted": attempted, "delivered": delivered, **({"error": result["error"]} if "error" in result else {})}

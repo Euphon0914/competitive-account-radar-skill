@@ -258,3 +258,14 @@ OK
 ```
 
 Digest bodies are immutable once sending, with supplemental rows for late items; dispatch drains single-row claims until empty; and publishers serialize per-run manifests under the SQLite write lock with attempt-scoped journals.
+
+## Final TOCTOU/loop serialization GREEN
+
+Final full-suite command: `python -m unittest tests.test_monitor_core tests.test_monitor_delivery -v`
+
+```
+Ran 69 tests in 5.034s
+OK
+```
+
+Digest selection and mutation now run under one SQLite write transaction with pending-row guards. Dispatch uses an explicit resource-releasing loop rather than recursion, and publication reconciliation is locked before journal scanning.
