@@ -29,8 +29,7 @@ NOW = datetime(2026, 8, 17, 12, 0, tzinfo=timezone.utc)
 def profile():
     return {
         "version": 1,
-        "salesperson": "Lin",
-        "alert_recipient": "lin@example.com",
+        "salesperson": {"name": "Lin", "alert_email": "lin@example.com"},
         "timezone": "Asia/Shanghai",
         "smtp": {"env": {"host": "CI_SMTP_HOST", "port": "CI_SMTP_PORT", "username": "CI_SMTP_USERNAME", "password": "CI_SMTP_PASSWORD", "from": "CI_SMTP_FROM"}},
         "competitors": ["Acme"],
@@ -79,7 +78,8 @@ class MonitorCoreTests(unittest.TestCase):
             import yaml
             saved = yaml.safe_load(path.read_text(encoding="utf-8"))
             self.assertEqual(saved["version"], 1)
-            self.assertEqual(saved["salesperson"], "Lin")
+            self.assertEqual(saved["salesperson"], {"name": "Lin", "alert_email": "lin@example.com"})
+            self.assertNotIn("alert_recipient", saved)
             self.assertEqual(saved["smtp"]["env"]["password"], "CI_SMTP_PASSWORD")
             self.assertNotIn("secret", path.read_text(encoding="utf-8").lower())
             self.assertEqual(saved["competitors"], ["Acme", "Rival"])
@@ -118,8 +118,27 @@ class MonitorCoreTests(unittest.TestCase):
     def test_profile_validation_identifies_required_configuration(self):
         errors = validate_profile({})
         self.assertTrue(any("salesperson" in error for error in errors))
-        self.assertTrue(any("recipient" in error for error in errors))
+        self.assertTrue(any("alert_email" in error for error in errors))
         self.assertTrue(any("source" in error for error in errors))
+
+    def test_profile_requires_nested_salesperson_alert_email_with_full_string_validation(self):
+        invalid = profile()
+        invalid["salesperson"] = "Lin"
+        invalid["alert_recipient"] = "lin@example.com\n"
+        errors = validate_profile(invalid)
+        self.assertIn("salesperson.alert_email is invalid", errors)
+        nested_invalid = profile()
+        nested_invalid["salesperson"]["alert_email"] = "lin@example.com\n"
+        self.assertIn("salesperson.alert_email is invalid", validate_profile(nested_invalid))
+
+    def test_wizard_recovers_from_non_utf8_existing_profile(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            project.joinpath("monitoring.yaml").write_bytes(b"\xff\xfe")
+            answers = iter(["Lin", "lin@example.com", "", "", "", "", "", "", "Acme", "", "file.txt", ""])
+            path = run_init_wizard(project, input_fn=lambda prompt: next(answers), output_fn=lambda _: None)
+            import yaml
+            self.assertEqual(yaml.safe_load(path.read_text(encoding="utf-8"))["salesperson"]["alert_email"], "lin@example.com")
 
     def test_load_observations_accepts_all_signal_types(self):
         signal_types = ["competitor.price", "competitor.portfolio", "competitor.partnership", "account.business", "account.satisfaction", "account.need"]
@@ -157,6 +176,20 @@ class MonitorCoreTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "line 1.*observed_at"):
                 load_observations(path)
 
+    def test_load_observations_rejects_non_finite_normalized_json_values(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "observations.jsonl"
+            write_jsonl(path, [observation(value=float("nan"))])
+            with self.assertRaisesRegex(ValueError, "line 1.*NaN"):
+                load_observations(path)
+
+    def test_load_observations_requires_zero_padded_effective_date(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "observations.jsonl"
+            write_jsonl(path, [observation(effective_date="2026-8-1")])
+            with self.assertRaisesRegex(ValueError, "line 1.*effective_date"):
+                load_observations(path)
+
     def test_wizard_allows_an_account_when_competitors_are_blank(self):
         with tempfile.TemporaryDirectory() as temporary:
             answers = iter(["Lin", "lin@example.com", "", "", "", "", "", "", "", "Globex", "file.txt", ""])
@@ -178,6 +211,13 @@ class MonitorCoreTests(unittest.TestCase):
         future = observation(observed_at=(NOW + timedelta(seconds=1)).isoformat())
         with self.assertRaisesRegex(ValueError, "future"):
             calculate_confidence(future, NOW)
+
+    def test_evaluate_prefixes_future_observations_with_their_jsonl_line(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project, path = Path(temporary), Path(temporary) / "observations.jsonl"
+            write_jsonl(path, [observation(observed_at=(NOW + timedelta(seconds=1)).isoformat())])
+            with self.assertRaisesRegex(ValueError, "line 1.*future"):
+                evaluate(project, path, "manual", NOW)
 
     def test_evaluation_baselines_changes_then_suppresses_repeats(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -246,6 +286,20 @@ class MonitorCoreTests(unittest.TestCase):
             finally:
                 connection.close()
 
+    def test_evaluate_does_not_enqueue_delivery_or_digest_rows(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project, path = Path(temporary), Path(temporary) / "observations.jsonl"
+            write_jsonl(path, [observation(value={"price": 100})])
+            evaluate(project, path, "manual", NOW)
+            write_jsonl(path, [observation(value={"price": 90}, content_hash="changed")])
+            self.assertEqual(len(evaluate(project, path, "manual", NOW)["candidates"]), 1)
+            connection = sqlite3.connect(project / ".competitive-radar" / "state.db")
+            try:
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0], 0)
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM digest_items").fetchone()[0], 0)
+            finally:
+                connection.close()
+
     def test_fingerprint_uses_effective_month_bucket(self):
         first = observation(effective_date="2026-08-01")
         second = observation(effective_date="2026-08-31")
@@ -269,6 +323,14 @@ class MonitorCoreTests(unittest.TestCase):
             Path(temporary, "monitoring.yaml").write_text(yaml.safe_dump(profile()), encoding="utf-8")
             valid = subprocess.run([sys.executable, str(script), "validate", "--project", temporary], text=True, capture_output=True, check=False)
             self.assertEqual(valid.returncode, 0)
+
+    def test_cli_validate_non_utf8_profile_is_an_invalid_profile(self):
+        script = ROOT / "monitor-competitive-account-signals" / "scripts" / "monitor.py"
+        with tempfile.TemporaryDirectory() as temporary:
+            Path(temporary, "monitoring.yaml").write_bytes(b"\xff")
+            result = subprocess.run([sys.executable, str(script), "validate", "--project", temporary], text=True, capture_output=True, check=False)
+            self.assertEqual(result.returncode, 1)
+            self.assertNotIn("Traceback", result.stderr)
 
 
 if __name__ == "__main__":

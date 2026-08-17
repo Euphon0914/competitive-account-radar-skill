@@ -20,7 +20,7 @@ SIGNAL_TYPES = {
     "competitor.price", "competitor.portfolio", "competitor.partnership",
     "account.business", "account.satisfaction", "account.need",
 }
-EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+EMAIL_PATTERN = re.compile(r"[^\s@]+@[^\s@]+\.[^\s@]+")
 SMTP_DEFAULTS = {
     "host": "CI_SMTP_HOST", "port": "CI_SMTP_PORT", "username": "CI_SMTP_USERNAME",
     "password": "CI_SMTP_PASSWORD", "from": "CI_SMTP_FROM",
@@ -42,11 +42,12 @@ def validate_profile(profile: dict) -> list[str]:
         return ["profile must be a mapping"]
     if profile.get("version") != 1:
         errors.append("version must be 1")
-    if not isinstance(profile.get("salesperson"), str) or not profile["salesperson"].strip():
-        errors.append("salesperson is required")
-    recipient = profile.get("alert_recipient")
-    if not isinstance(recipient, str) or not EMAIL_PATTERN.match(recipient):
-        errors.append("alert recipient email is invalid")
+    salesperson = profile.get("salesperson")
+    if not isinstance(salesperson, dict) or not isinstance(salesperson.get("name"), str) or not salesperson["name"].strip():
+        errors.append("salesperson.name is required")
+    recipient = salesperson.get("alert_email") if isinstance(salesperson, dict) else None
+    if not isinstance(recipient, str) or EMAIL_PATTERN.fullmatch(recipient) is None:
+        errors.append("salesperson.alert_email is invalid")
     if not isinstance(profile.get("timezone"), str) or not _timezone_is_valid(profile["timezone"]):
         errors.append("timezone must be a valid IANA timezone")
     smtp = profile.get("smtp")
@@ -90,14 +91,14 @@ def run_init_wizard(project: Path, input_fn=input, output_fn=print) -> Path | No
         if target.exists():
             try:
                 existing = yaml.safe_load(target.read_text(encoding="utf-8"))
-            except yaml.YAMLError:
+            except (OSError, UnicodeError, yaml.YAMLError):
                 existing = None
             if not validate_profile(existing if isinstance(existing, dict) else {}):
                 confirmation = input_fn("A valid monitoring.yaml exists. Overwrite? [y/N]: ").strip().lower()
                 if confirmation not in {"y", "yes"}:
                     return None
         salesperson = _ask(input_fn, output_fn, "Salesperson name")
-        recipient = _ask(input_fn, output_fn, "Alert recipient email", validator=lambda value: bool(EMAIL_PATTERN.match(value)))
+        recipient = _ask(input_fn, output_fn, "Alert recipient email", validator=lambda value: EMAIL_PATTERN.fullmatch(value) is not None)
         timezone_name = _ask(input_fn, output_fn, "IANA timezone", default="Asia/Shanghai", validator=_timezone_is_valid)
         smtp_env = {key: _ask(input_fn, output_fn, f"SMTP {key} environment-variable name", default=value) for key, value in SMTP_DEFAULTS.items()}
         competitors = _comma_items(input_fn("Competitors (comma-separated): "))
@@ -118,7 +119,7 @@ def run_init_wizard(project: Path, input_fn=input, output_fn=print) -> Path | No
             if source:
                 sources.append(source)
         profile = {
-            "version": 1, "salesperson": salesperson, "alert_recipient": recipient, "timezone": timezone_name,
+            "version": 1, "salesperson": {"name": salesperson, "alert_email": recipient}, "timezone": timezone_name,
             "smtp": {"env": smtp_env}, "competitors": competitors, "accounts": accounts, "sources": sources,
             "policy": {"scan_interval_minutes": 60, "daily_digest_time": "17:30"},
         }
@@ -169,11 +170,13 @@ def _validate_observation(item: object, line_number: int) -> dict:
         if not isinstance(effective, str):
             raise ValueError(f"line {line_number}: effective_date must be YYYY-MM-DD or null")
         try:
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", effective) is None:
+                raise ValueError
             datetime.strptime(effective, "%Y-%m-%d")
         except ValueError as error:
             raise ValueError(f"line {line_number}: effective_date must be YYYY-MM-DD or null") from error
     try:
-        json.dumps(item.get("normalized_value"), sort_keys=True, separators=(",", ":"))
+        json.dumps(item.get("normalized_value"), sort_keys=True, separators=(",", ":"), allow_nan=False)
     except (TypeError, ValueError) as error:
         raise ValueError(f"line {line_number}: normalized_value must be JSON-compatible") from error
     for key in ("source_quality", "extraction_certainty"):
@@ -193,9 +196,13 @@ def _validate_observation(item: object, line_number: int) -> dict:
     return clean
 
 
-def load_observations(path: Path) -> list[dict]:
-    """Read and completely validate JSONL observations before state mutation."""
-    observations: list[dict] = []
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-standard JSON constant {value}")
+
+
+def _load_observations_with_lines(path: Path) -> list[tuple[int, dict]]:
+    """Read and validate JSONL observations while retaining physical line numbers."""
+    observations: list[tuple[int, dict]] = []
     try:
         lines = Path(path).read_text(encoding="utf-8").splitlines()
     except OSError as error:
@@ -204,11 +211,18 @@ def load_observations(path: Path) -> list[dict]:
         if not line.strip():
             continue
         try:
-            decoded = json.loads(line)
+            decoded = json.loads(line, parse_constant=_reject_json_constant)
         except json.JSONDecodeError as error:
             raise ValueError(f"line {line_number}: invalid JSON ({error.msg})") from error
-        observations.append(_validate_observation(decoded, line_number))
+        except ValueError as error:
+            raise ValueError(f"line {line_number}: invalid JSON ({error})") from error
+        observations.append((line_number, _validate_observation(decoded, line_number)))
     return observations
+
+
+def load_observations(path: Path) -> list[dict]:
+    """Read and completely validate JSONL observations before state mutation."""
+    return [observation for _, observation in _load_observations_with_lines(path)]
 
 
 def calculate_confidence(observation: dict, now: datetime) -> float:
@@ -265,10 +279,14 @@ def _severity_rank(value: str | None) -> int:
 
 def evaluate(project: Path, observations_path: Path, trigger: str, now: datetime) -> dict:
     """Transactionally record observations and return deterministic event decisions."""
-    observations = load_observations(observations_path)
+    numbered_observations = _load_observations_with_lines(observations_path)
+    observations = [item for _, item in numbered_observations]
     # Validate all time-sensitive data before creating a run or observation row.
-    for item in observations:
-        calculate_confidence(item, now)
+    for line_number, item in numbered_observations:
+        try:
+            calculate_confidence(item, now)
+        except ValueError as error:
+            raise ValueError(f"line {line_number}: {error}") from error
     connection = _open_database(Path(project))
     try:
         with connection:
@@ -305,8 +323,6 @@ def evaluate(project: Path, observations_path: Path, trigger: str, now: datetime
                         connection.execute("INSERT INTO events (fingerprint, severity, content_hash, first_run_id, last_run_id) VALUES (?, ?, ?, ?, ?)", (fingerprint, severity, item["content_hash"], run_id, run_id))
                     else:
                         connection.execute("UPDATE events SET severity = ?, content_hash = ?, last_run_id = ? WHERE fingerprint = ?", (severity, item["content_hash"], run_id, fingerprint))
-                    connection.execute("INSERT INTO deliveries (event_fingerprint, created_at, status) VALUES (?, ?, 'candidate')", (fingerprint, now.isoformat()))
-                    connection.execute("INSERT INTO digest_items (run_id, event_fingerprint) VALUES (?, ?)", (run_id, fingerprint))
                 else:
                     suppressed.append(payload)
             return {"schema_version": 1, "run_id": run_id, "trigger": trigger, "baseline": baseline, "candidates": candidates, "suppressed": suppressed, "recorded_only": recorded_only}
@@ -318,7 +334,7 @@ def _load_profile(project: Path) -> dict:
     path = Path(project) / "monitoring.yaml"
     try:
         loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except (OSError, yaml.YAMLError) as error:
+    except (OSError, UnicodeError, yaml.YAMLError) as error:
         raise ValueError(f"could not load monitoring.yaml: {error}") from error
     if not isinstance(loaded, dict):
         raise ValueError("monitoring.yaml must contain a mapping")
