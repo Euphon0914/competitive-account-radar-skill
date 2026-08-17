@@ -1,0 +1,18 @@
+version: 1
+salesperson:
+  name: 演示销售
+  alert_email: demo.sales@example.invalid
+timezone: Asia/Shanghai
+smtp:
+  env:
+    host: CI_SMTP_HOST
+    port: CI_SMTP_PORT
+    username: CI_SMTP_USERNAME
+    password: CI_SMTP_PASSWORD
+    from: CI_SMTP_FROM
+competitors: [演示竞品]
+accounts: [演示客户]
+sources: [https://example.invalid/radar]
+policy:
+  scan_interval_minutes: 60
+  daily_digest_time: "17:30"
