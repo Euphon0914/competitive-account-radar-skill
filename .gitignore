@@ -1,0 +1,17 @@
+.worktrees/
+.superpowers/
+.venv/
+__pycache__/
+*.py[cod]
+.env
+.env.*
+monitoring.yaml
+.competitive-radar/
+*.db
+*.sqlite
+*.sqlite3
+runs/
+dist/
+*.zip
+SHA256SUMS.txt
+
