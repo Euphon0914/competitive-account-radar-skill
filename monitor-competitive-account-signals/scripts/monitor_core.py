@@ -25,6 +25,13 @@ SMTP_DEFAULTS = {
     "host": "CI_SMTP_HOST", "port": "CI_SMTP_PORT", "username": "CI_SMTP_USERNAME",
     "password": "CI_SMTP_PASSWORD", "from": "CI_SMTP_FROM",
 }
+SMTP_PROVIDERS = {
+    "1": {"name": "Gmail / Google Workspace", "host": "smtp.gmail.com", "port": "587", "note": "使用 STARTTLS。开启两步验证后创建应用专用密码；不要使用网页登录密码。"},
+    "2": {"name": "Microsoft 365 / Outlook", "host": "smtp.office365.com", "port": "587", "note": "使用 STARTTLS。管理员必须允许 SMTP AUTH；企业策略可能要求管理员协助。"},
+    "3": {"name": "QQ 邮箱", "host": "smtp.qq.com", "port": "587", "note": "开启 SMTP 服务并生成授权码；不要使用 QQ 登录密码。"},
+    "4": {"name": "163 邮箱", "host": "smtp.163.com", "port": "", "note": "先在邮箱设置中开启 SMTP 并生成客户端授权码。常见 465 是隐式 SSL；本版本只支持 STARTTLS，需向 163 确认可用的 STARTTLS 端口后再继续。"},
+    "5": {"name": "其他 SMTP", "host": "", "port": "", "note": "向邮箱服务商确认 STARTTLS 主机、端口、用户名、发件人和应用专用密码要求。"},
+}
 SCHEMA_VERSION = 4
 
 
@@ -84,6 +91,38 @@ def _comma_items(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def _choose_smtp_provider(input_fn, output_fn) -> dict[str, str]:
+    """Explain supported SMTP choices without collecting any secret."""
+    output_fn("SMTP setup: choose a provider. This wizard stores environment-variable names only; never enter a password here.")
+    for key, provider in SMTP_PROVIDERS.items():
+        output_fn(f"  {key}. {provider['name']}")
+    while True:
+        selected = input_fn("SMTP provider [5]: ").strip() or "5"
+        provider = SMTP_PROVIDERS.get(selected)
+        if provider is not None:
+            output_fn(f"{provider['name']}: {provider['note']}")
+            return provider
+        output_fn("Choose 1, 2, 3, 4, or 5.")
+
+
+def powershell_smtp_setup(provider: dict[str, str], environment_names: dict[str, str]) -> str:
+    """Return a copyable local-only PowerShell setup guide, never a secret value."""
+    host, port = provider["host"], provider["port"]
+    host_line = f'$values["{environment_names["host"]}"] = "{host}"' if host else f'# Set {environment_names["host"]} to your SMTP host'
+    port_line = f'$values["{environment_names["port"]}"] = "{port}"' if port else f'# Set {environment_names["port"]} to your STARTTLS port'
+    return "\n".join((
+        "Run the following only in your own Windows PowerShell window. Do not paste a password into Codex.",
+        "$values = @{}", host_line, port_line,
+        f'$values["{environment_names["username"]}"] = Read-Host "SMTP username or sender email"',
+        f'$values["{environment_names["from"]}"] = Read-Host "From email"',
+        f'$values["{environment_names["password"]}"] = [System.Net.NetworkCredential]::new("", (Read-Host "SMTP app password" -AsSecureString)).Password',
+        "$values.GetEnumerator() | ForEach-Object { [Environment]::SetEnvironmentVariable($_.Key, $_.Value, 'User') }",
+        "Remove-Variable values",
+        "Close this terminal and open a new one. The password is not printed, but user environment variables are readable by programs running as you.",
+        f'@("{environment_names["host"]}", "{environment_names["port"]}", "{environment_names["username"]}", "{environment_names["password"]}", "{environment_names["from"]}") | ForEach-Object {{ "$_: " + [bool][Environment]::GetEnvironmentVariable($_, "User") }}',
+    ))
+
+
 def _write_profile_atomically(target: Path, profile: dict) -> None:
     """Durably replace a profile without reusing a predictable temporary path."""
     temporary_path: Path | None = None
@@ -122,7 +161,9 @@ def run_init_wizard(project: Path, input_fn=input, output_fn=print) -> Path | No
         salesperson = _ask(input_fn, output_fn, "Salesperson name")
         recipient = _ask(input_fn, output_fn, "Alert recipient email", validator=lambda value: EMAIL_PATTERN.fullmatch(value) is not None)
         timezone_name = _ask(input_fn, output_fn, "IANA timezone", default="Asia/Shanghai", validator=_timezone_is_valid)
+        provider = _choose_smtp_provider(input_fn, output_fn)
         smtp_env = {key: _ask(input_fn, output_fn, f"SMTP {key} environment-variable name", default=value) for key, value in SMTP_DEFAULTS.items()}
+        output_fn(powershell_smtp_setup(provider, smtp_env))
         competitors = _comma_items(input_fn("Competitors (comma-separated): "))
         accounts = _comma_items(input_fn("Key accounts (comma-separated): "))
         while not competitors and not accounts:

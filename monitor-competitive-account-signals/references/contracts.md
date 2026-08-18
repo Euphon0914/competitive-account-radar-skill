@@ -14,4 +14,4 @@
 
 ## SMTP
 
-运行时只读取 `CI_SMTP_HOST`、`CI_SMTP_PORT`、`CI_SMTP_USERNAME`、`CI_SMTP_PASSWORD`、`CI_SMTP_FROM`（或档案中对应的变量名）。凭据不得进入 YAML、输出或日志。高/中等级即时入队，低等级进入 17:30 摘要；失败按 1、5、30、120 分钟重试，最多五次。
+运行时只读取 `CI_SMTP_HOST`、`CI_SMTP_PORT`、`CI_SMTP_USERNAME`、`CI_SMTP_PASSWORD`、`CI_SMTP_FROM`（或档案中对应的变量名）。凭据不得进入 YAML、输出或日志。发送器使用 STARTTLS；用户名为空时不登录，其他情况下必须有密码。高/中等级即时入队，低等级进入 17:30 摘要；失败按 1、5、30、120 分钟重试，最多五次。

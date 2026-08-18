@@ -52,6 +52,38 @@ python <skill目录>/scripts/monitor.py init --project <监控项目目录>
 
 向导会询问销售姓名、**内部预警收件邮箱**、时区、SMTP 环境变量名称、竞品、大客户及信息来源。只有完成必填项才会写入 `monitoring.yaml`；不会猜测这些信息，也不会要求输入 SMTP 密码。
 
+### SMTP 新手配置（Windows）
+
+`init` 会先询问你的邮箱服务商，再说明主机、端口和授权要求，并打印一段应在**你自己的 PowerShell 窗口**执行的配置步骤。它不会让你把密码发送给 Codex，也不会把密码写入 `monitoring.yaml`。
+
+| 服务商 | 本 Skill 可用的推荐设置 | 先完成的账号操作 |
+| --- | --- | --- |
+| Gmail / Google Workspace | `smtp.gmail.com`，端口 `587`，STARTTLS | 开启两步验证并创建应用专用密码；不要使用网页登录密码。 |
+| Microsoft 365 / Outlook | `smtp.office365.com`，端口 `587`，STARTTLS | 确认管理员已允许 SMTP AUTH；受企业策略限制时联系管理员。 |
+| QQ 邮箱 | `smtp.qq.com`，端口 `587`，STARTTLS | 在邮箱设置中开启 SMTP 并生成授权码。 |
+| 163 邮箱 | 仅在服务商确认提供 STARTTLS 端口后填写 | 开启 SMTP 并生成客户端授权码。常见的 `465` 是隐式 SSL，当前版本不支持。 |
+| 其他 SMTP | 填写服务商提供的 STARTTLS 主机和端口 | 确认应用专用密码、SMTP 权限和发件人要求。 |
+
+下面是 Gmail 的安全输入示例。将它运行在 **PowerShell**，而不是 Codex 聊天框；密码输入不回显，也不打印。运行后关闭终端并重新打开，环境变量才会被新进程读取。
+
+```powershell
+$values = @{
+  CI_SMTP_HOST = "smtp.gmail.com"
+  CI_SMTP_PORT = "587"
+  CI_SMTP_USERNAME = Read-Host "Gmail address"
+  CI_SMTP_FROM = Read-Host "From email"
+}
+$values["CI_SMTP_PASSWORD"] = [System.Net.NetworkCredential]::new("", (Read-Host "Gmail app password" -AsSecureString)).Password
+$values.GetEnumerator() | ForEach-Object { [Environment]::SetEnvironmentVariable($_.Key, $_.Value, "User") }
+Remove-Variable values
+```
+
+用户级环境变量仍可能被以你身份运行的程序读取；请使用专用发信账号和应用专用密码，且不要截屏、复制或提交这些值。可只检查变量是否已设置（不会显示值）：
+
+```powershell
+@("CI_SMTP_HOST", "CI_SMTP_PORT", "CI_SMTP_USERNAME", "CI_SMTP_PASSWORD", "CI_SMTP_FROM") | ForEach-Object { "$_: " + [bool][Environment]::GetEnvironmentVariable($_, "User") }
+```
+
 ### 3. 评估并派送变化
 
 先使用网页、文档、表格或 PDF 工具，将材料提取为符合[观察契约](monitor-competitive-account-signals/references/contracts.md#观察记录)的 `observations.jsonl`，再运行：
@@ -73,6 +105,12 @@ python <skill目录>/scripts/monitor.py dispatch --project <监控项目目录>
 
 ```text
 使用 $monitor-competitive-account-signals 帮我创建竞争与大客户监控档案。先通过交互式对话收集我的姓名、内部预警邮箱、时区、竞品、大客户和资料来源；不要猜测这些信息，也不要要求 SMTP 密码。完成后创建隔离运行环境，并告诉我如何进行第一次基线扫描。
+```
+
+### 带我配置 SMTP（新手）
+
+```text
+使用 $monitor-competitive-account-signals 带我配置 Gmail、Microsoft 365/Outlook、QQ、163 或其他 SMTP。先问我使用哪个服务商，解释主机、端口、STARTTLS、SMTP 权限和应用专用密码；只给我本机 PowerShell 安全输入步骤。绝不要求我在 Codex 对话中粘贴、显示或复述密码，也不要把密码写入 YAML、日志或 Git。
 ```
 
 ### 分析一批最新资料
