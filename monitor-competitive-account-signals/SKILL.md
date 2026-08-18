@@ -15,6 +15,12 @@ description: Use when salespeople monitor competitor pricing, product, or partne
 4. 为候选事件补充证据约束的个人销售行动。不要编造事实、折扣、价格、合同权限或客户承诺；采用 [领域规则](references/domain-rules.md)。
 5. 以契约 JSON 草稿执行 `publish`、`dispatch`，并由外部计划任务调用 `digest`。如有排队或失败，准确报告，不宣称已送达。
 
+## SMTP 新手引导
+
+在首次 `init` 前后，先询问用户的服务商：Gmail/Google Workspace、Microsoft 365/Outlook、QQ、163 或其他 SMTP。解释此 Skill 使用 STARTTLS；推荐 Gmail、Microsoft 和 QQ 使用端口 587。163 常见的隐式 SSL/465 与当前发送器不兼容，要求用户向服务商确认 STARTTLS 端口。
+
+只引导用户在自己的 Windows PowerShell 使用 `Read-Host -AsSecureString` 输入应用专用密码，再写入当前用户环境变量。绝不要求、显示、复述、记录或验证密码；绝不自动执行含秘密值的命令。`monitoring.yaml` 只能保存五个变量名称。
+
 ## 命令速查
 
 | 目的 | 命令 |

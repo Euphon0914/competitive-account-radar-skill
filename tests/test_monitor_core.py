@@ -19,6 +19,7 @@ from monitor import (  # noqa: E402
     evaluate,
     event_fingerprint,
     load_observations,
+    powershell_smtp_setup,
     run_init_wizard,
     validate_profile,
 )
@@ -71,7 +72,7 @@ class MonitorCoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary)
             answers = iter([
-                "Lin", "lin@example.com", "", "", "", "", "", "", "Acme, Rival", "Globex", "https://example.com/a", "./notes.txt", "",
+                "Lin", "lin@example.com", "", "1", "", "", "", "", "", "Acme, Rival", "Globex", "https://example.com/a", "./notes.txt", "",
             ])
             output = []
             path = run_init_wizard(project, input_fn=lambda prompt: next(answers), output_fn=output.append)
@@ -91,7 +92,7 @@ class MonitorCoreTests(unittest.TestCase):
             project = Path(temporary)
             stale_name = project / ".monitoring.yaml.tmp"
             stale_name.write_text("unrelated", encoding="utf-8")
-            answers = iter(["Lin", "lin@example.com", "", "", "", "", "", "", "Acme", "", "file.txt", ""])
+            answers = iter(["Lin", "lin@example.com", "", "5", "", "", "", "", "", "Acme", "", "file.txt", ""])
             run_init_wizard(project, input_fn=lambda prompt: next(answers), output_fn=lambda _: None)
             self.assertTrue(stale_name.exists())
             self.assertEqual(stale_name.read_text(encoding="utf-8"), "unrelated")
@@ -100,9 +101,9 @@ class MonitorCoreTests(unittest.TestCase):
     def test_wizard_prompts_smtp_environment_names_in_contract_order(self):
         with tempfile.TemporaryDirectory() as temporary:
             prompts = []
-            answers = iter(["Lin", "lin@example.com", "", "", "", "", "", "", "Acme", "", "file.txt", ""])
+            answers = iter(["Lin", "lin@example.com", "", "5", "", "", "", "", "", "Acme", "", "file.txt", ""])
             run_init_wizard(Path(temporary), input_fn=lambda prompt: (prompts.append(prompt), next(answers))[1], output_fn=lambda _: None)
-            smtp_prompts = [prompt for prompt in prompts if prompt.startswith("SMTP ")]
+            smtp_prompts = [prompt for prompt in prompts if "environment-variable name" in prompt]
             self.assertEqual(smtp_prompts, [
                 "SMTP host environment-variable name [CI_SMTP_HOST]: ",
                 "SMTP port environment-variable name [CI_SMTP_PORT]: ",
@@ -111,9 +112,32 @@ class MonitorCoreTests(unittest.TestCase):
                 "SMTP from environment-variable name [CI_SMTP_FROM]: ",
             ])
 
+    def test_wizard_explains_gmail_and_emits_local_only_secret_setup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            answers = iter(["Lin", "lin@example.com", "", "1", "", "", "", "", "", "Acme", "", "file.txt", ""])
+            output = []
+            saved = run_init_wizard(Path(temporary), input_fn=lambda prompt: next(answers), output_fn=output.append)
+            text = "\n".join(output)
+            self.assertIn("Gmail / Google Workspace", text)
+            self.assertIn("smtp.gmail.com", text)
+            self.assertIn("Read-Host \"SMTP app password\" -AsSecureString", text)
+            self.assertIn("SetEnvironmentVariable", text)
+            self.assertNotIn("lin@example.com", saved.read_text(encoding="utf-8").split("smtp:")[1])
+            self.assertNotIn("app password", saved.read_text(encoding="utf-8").lower())
+
+    def test_other_smtp_setup_leaves_host_and_port_for_user_without_revealing_password(self):
+        guide = powershell_smtp_setup(
+            {"name": "其他 SMTP", "host": "", "port": "", "note": "manual"},
+            {"host": "H", "port": "P", "username": "U", "password": "S", "from": "F"},
+        )
+        self.assertIn("Set H to your SMTP host", guide)
+        self.assertIn("Set P to your STARTTLS port", guide)
+        self.assertIn("Read-Host \"SMTP app password\" -AsSecureString", guide)
+        self.assertNotIn("Write-Host", guide)
+
     def test_wizard_reprompts_invalid_email_and_timezone(self):
         with tempfile.TemporaryDirectory() as temporary:
-            answers = iter(["Lin", "wrong", "lin@example.com", "Mars/Olympus", "UTC", "", "", "", "", "", "Acme", "", "file.txt", ""])
+            answers = iter(["Lin", "wrong", "lin@example.com", "Mars/Olympus", "UTC", "5", "", "", "", "", "", "Acme", "", "file.txt", ""])
             output = []
             run_init_wizard(Path(temporary), input_fn=lambda prompt: next(answers), output_fn=output.append)
             text = "\n".join(output)
@@ -131,7 +155,7 @@ class MonitorCoreTests(unittest.TestCase):
             project = Path(temporary)
             project.joinpath("monitoring.yaml").write_text("salesperson: Original\n", encoding="utf-8")
             # Invalid partial profiles do not count as an existing valid profile.
-            answers = iter(["Lin", "lin@example.com", "", "", "", "", "", "", "Acme", "", "file.txt", ""])
+            answers = iter(["Lin", "lin@example.com", "", "5", "", "", "", "", "", "Acme", "", "file.txt", ""])
             run_init_wizard(project, input_fn=lambda prompt: next(answers), output_fn=lambda _: None)
             saved = project.joinpath("monitoring.yaml").read_text(encoding="utf-8")
             self.assertIn("Lin", saved)
@@ -161,7 +185,7 @@ class MonitorCoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary)
             project.joinpath("monitoring.yaml").write_bytes(b"\xff\xfe")
-            answers = iter(["Lin", "lin@example.com", "", "", "", "", "", "", "Acme", "", "file.txt", ""])
+            answers = iter(["Lin", "lin@example.com", "", "5", "", "", "", "", "", "Acme", "", "file.txt", ""])
             path = run_init_wizard(project, input_fn=lambda prompt: next(answers), output_fn=lambda _: None)
             import yaml
             self.assertEqual(yaml.safe_load(path.read_text(encoding="utf-8"))["salesperson"]["alert_email"], "lin@example.com")
@@ -225,7 +249,7 @@ class MonitorCoreTests(unittest.TestCase):
 
     def test_wizard_allows_an_account_when_competitors_are_blank(self):
         with tempfile.TemporaryDirectory() as temporary:
-            answers = iter(["Lin", "lin@example.com", "", "", "", "", "", "", "", "Globex", "file.txt", ""])
+            answers = iter(["Lin", "lin@example.com", "", "5", "", "", "", "", "", "", "Globex", "file.txt", ""])
             saved = run_init_wizard(Path(temporary), input_fn=lambda prompt: next(answers), output_fn=lambda _: None)
             import yaml
             profile_data = yaml.safe_load(saved.read_text(encoding="utf-8"))
