@@ -24,12 +24,22 @@
 
 ## 3 步开始使用
 
+> **先分清两类内容：**标注为 `powershell` 的代码块要在 Windows 的 **PowerShell 或 Windows Terminal** 中运行；标注为 `text` 的“提示词”要复制到 **Codex 聊天输入框**中发送，不能粘贴到 PowerShell。`<skill目录>` 和 `<监控项目目录>` 是占位符，必须替换成自己的真实文件夹路径，尖括号本身不要输入。
+
 ### 1. 安装运行环境
 
 将 `monitor-competitive-account-signals` 复制到 Codex Skills 目录，然后在独立的监控项目中创建隔离虚拟环境：
 
 ```powershell
 python <skill目录>/scripts/bootstrap.py --project <监控项目目录>
+```
+
+Windows 示例：按 `Win + X`，选择“终端”或“PowerShell”，将路径替换为你的实际位置后执行：
+
+```powershell
+$skill = "C:\Codex\skills\monitor-competitive-account-signals"
+$project = "C:\SalesRadar\my-monitoring-project"
+python "$skill\scripts\bootstrap.py" --project $project
 ```
 
 ### 2. 完成交互式监控档案
@@ -57,7 +67,7 @@ python <skill目录>/scripts/monitor.py dispatch --project <监控项目目录>
 
 ## 直接复制给 Codex 的提示词
 
-无需记住命令；将以下任一提示词直接发送给 Codex。首次提示会先触发必要的交互式问题，不要在对话中提供 SMTP 密码。
+无需记住命令；将以下任一提示词复制到 **Codex 聊天输入框**后发送，**不要在 PowerShell 中运行**。首次提示会先触发必要的交互式问题，不要在对话中提供 SMTP 密码。
 
 ### 首次建立监控
 
