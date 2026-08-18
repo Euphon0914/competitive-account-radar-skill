@@ -1,32 +1,91 @@
 # 竞争与客户战情雷达 Skill
 
-`monitor-competitive-account-signals` 为个人销售提供双引擎：从公开 URL 与本地资料识别竞品价格、产品组合、合作，以及大客户业务、满意度、需求信号；再把有证据的变化转为内部预警和可执行的下一步。
+`monitor-competitive-account-signals` 是一个面向个人销售的竞争与客户战情雷达。它将公开网页和本地资料中零散的外部信号，转为带证据、可去重、可派送的内部预警，以及可执行的下一步销售建议。
 
-## 安装与首次使用
+## 它解决什么问题
 
-复制 `monitor-competitive-account-signals` 到 Codex Skills 目录，在监控项目中运行：
+销售人员往往需要手动关注竞品调价、产品更新、合作新闻，以及重点客户的业务、满意度与需求变化。信息分散、重复出现且难以判断优先级时，真正重要的变化容易被错过。
+
+本 Skill 将这两类工作合并为两个协作引擎：
+
+- **动态感知引擎**：标准化竞品与大客户信号，并保留来源、时间和原文证据。
+- **策略推荐引擎**：基于已知证据生成个人销售行动，不编造事实，也不会自行承诺价格、折扣或合同条件。
+
+## 可以实现的效果
+
+| 能力 | 结果 |
+| --- | --- |
+| 多来源信息整理 | 将 URL，以及 CSV、XLSX、JSON、TXT、Markdown、PDF、DOCX 中提取的证据统一为观察记录。 |
+| 六类业务信号识别 | 追踪竞品价格、产品组合、合作动向，以及大客户业务、满意度和需求变化。 |
+| 可信度与优先级判断 | 按来源质量、提取确定性、时效性和独立佐证评分，并结合影响与紧迫度确定等级。 |
+| 可追溯变化预警 | 使用稳定事件 ID、证据 ID 和 SQLite 状态去重；只在等级升级、关键值变化或实质新证据出现时再次通知。 |
+| 销售行动建议 | 每项告警可包含影响判断、24 小时/7 天行动、三个发现式问题、沟通话术、假设与升级条件。 |
+| 分级内部派送 | 高/中等级立即入队发送；低等级汇入本地时区 17:30 的每日摘要；失败邮件会按计划重试。 |
+
+## 3 步开始使用
+
+### 1. 安装运行环境
+
+将 `monitor-competitive-account-signals` 复制到 Codex Skills 目录，然后在独立的监控项目中创建隔离虚拟环境：
 
 ```powershell
 python <skill目录>/scripts/bootstrap.py --project <监控项目目录>
+```
+
+### 2. 完成交互式监控档案
+
+首次使用必须先运行初始化向导：
+
+```powershell
 python <skill目录>/scripts/monitor.py init --project <监控项目目录>
 ```
 
-`init` 会交互询问销售姓名、内部收件邮箱、时区、SMTP 环境变量名称、竞品、大客户和来源。未完成对话不会收集、评估或发信；不要把 SMTP 密码输入向导。
+向导会询问销售姓名、**内部预警收件邮箱**、时区、SMTP 环境变量名称、竞品、大客户及信息来源。只有完成必填项才会写入 `monitoring.yaml`；不会猜测这些信息，也不会要求输入 SMTP 密码。
 
-支持 URL 及 CSV、XLSX、JSON、TXT、Markdown、PDF、DOCX（先提取为观察 JSONL）。常用命令：
+### 3. 评估并派送变化
+
+先使用网页、文档、表格或 PDF 工具，将材料提取为符合[观察契约](monitor-competitive-account-signals/references/contracts.md#观察记录)的 `observations.jsonl`，再运行：
 
 ```powershell
-python <skill目录>/scripts/monitor.py evaluate --project <目录> --observations <observations.jsonl> --trigger scheduled
-python <skill目录>/scripts/monitor.py publish --project <目录> --draft <alerts.draft.json>
-python <skill目录>/scripts/monitor.py dispatch --project <目录>
-python <skill目录>/scripts/monitor.py digest --project <目录> --date 2026-08-17
+python <skill目录>/scripts/monitor.py validate --project <监控项目目录>
+python <skill目录>/scripts/monitor.py evaluate --project <监控项目目录> --observations <observations.jsonl> --trigger scheduled
+python <skill目录>/scripts/monitor.py publish --project <监控项目目录> --draft <alerts.draft.json>
+python <skill目录>/scripts/monitor.py dispatch --project <监控项目目录>
 ```
 
-由外部任务每 60 分钟运行评估/派送，并在本地时区 17:30 调用摘要。SMTP 只从 `CI_SMTP_HOST`、`CI_SMTP_PORT`、`CI_SMTP_USERNAME`、`CI_SMTP_PASSWORD`、`CI_SMTP_FROM` 环境变量读取。
+第一次成功评估只建立基线，不会发送“变化”告警。后续运行才会识别相对基线的有效变化。
 
-## 隐私与限制
+## 运行后会得到什么
 
-本仓库的 `.gitignore` 排除监控档案、SQLite 状态、运行产物和 `.env`；若监控项目本身也是 Git 仓库，请在该项目单独排除这些文件，且不要提交真实客户、邮箱、价格或竞争情报。系统仅给销售本人发内部通知，不连接 CRM/Slack/企业微信，不联系客户，不修改合同或商机，也不自动承诺折扣。它不会自己常驻、抓取受限来源或替代人工验证。
+每次成功发布都会生成共享事件 ID 的 `alerts.json` 与 `alerts.md`。一条合格告警会清楚回答：
+
+- **发生了什么**：信号类型、变化内容、来源和可核验的证据片段。
+- **为什么重要**：可信度、影响、紧迫度和告警等级。
+- **应该怎么做**：未来 24 小时和 7 天内的建议行动。
+- **如何推进对话**：恰好三个发现式问题与一段不含未经授权承诺的沟通话术。
+- **何时升级处理**：显式列出假设、升级条件，以及需要审批的商业承诺。
+
+高、中的候选事件会形成即时内部邮件；低等级候选事件等待每日摘要。邮件无法发送时，系统保留队列并按 1、5、30、120 分钟的间隔重试，最多五次。
+
+## 自动化运行建议
+
+Skill 不常驻运行。建议由任务计划程序、CI 或其他外部自动化每 60 分钟执行一次资料提取、`evaluate`、`publish` 和 `dispatch`，并在销售人员配置的本地时区每天 17:30 调用：
+
+```powershell
+python <skill目录>/scripts/monitor.py digest --project <监控项目目录> --date YYYY-MM-DD
+```
+
+SMTP 凭据只从环境变量读取：`CI_SMTP_HOST`、`CI_SMTP_PORT`、`CI_SMTP_USERNAME`、`CI_SMTP_PASSWORD`、`CI_SMTP_FROM`。可在监控档案中改用其他环境变量名称，但绝不应把密码写入 YAML、日志或 Git。
+
+## 隐私、授权与限制
+
+- 仅向配置的销售人员本人发送内部预警；不会自动联系客户。
+- 不会修改 CRM、商机或合同；第一版不接入 CRM、Slack、企业微信。
+- 不会承诺折扣、费用减免或合同条款；此类措辞必须有明确授权。
+- 404、URL 失效和文件解析失败只保留为来源失败，不会被当成业务变化。
+- 本仓库的 `.gitignore` 排除监控档案、SQLite 状态、运行产物与 `.env`。若监控项目本身也受 Git 管理，请在该项目单独排除这些敏感运行数据，不要提交真实客户、邮箱、价格或竞争情报。
+
+详细的数据格式、输出字段与评分规则请参阅 [运行契约](monitor-competitive-account-signals/references/contracts.md) 和 [领域规则](monitor-competitive-account-signals/references/domain-rules.md)。
 
 ## License
 
